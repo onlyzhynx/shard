@@ -13,6 +13,8 @@ the single hardest thing: reliably serve tokens through a multi-stage split. do 
 
 **✓ PASSED (2026-06-15).** 2-node split with per-node kv-cache. proven on Qwen2.5-14B (29.5GB bf16, OOMs one 24GB card) split 24/24 across two 4090s: 20/20 clean completions, ~17 tok/s decode, via our own tcp transport. code in `phase0/` (`node_kv.py` = the split node, `bench.py` = the 20x reliability harness). caveat: nodes are on a low-latency same-host link, not wan yet.
 
+**hardened (2026-06-15):** the transport is now fail-fast and instrumented — the direct answer to an opaque "broken pipe". per-edge socket timeouts (a dead OR frozen node raises a `TransportError` with context — which peer, which decode step, dropped vs timed-out — never an unbounded `recv`); `os._exit` on unrecoverable failure so the process dies in ms, not after a ~10s torch/cuda teardown; per-edge health logging (round-trip latency + uplink MB). verified by killing (SIGKILL) and freezing (SIGSTOP) the tail mid-generation — head fails cleanly both ways, no hang. this pre-validates part of phase 1's edge-supervision goal on the easy link.
+
 this was the thing that blocked us all day. it's the momentum milestone.
 
 ## phase 1 — make the transport survive wan (target: 3-5 days)

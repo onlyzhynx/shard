@@ -37,18 +37,19 @@ def main():
     ap.add_argument("--port", type=int, default=29501)
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--timeout", type=float, default=30.0)
     args = ap.parse_args()
     dev = "cuda"
     parts = load_parts(args.model, args.split, "head", device=dev)
     tok = AutoTokenizer.from_pretrained(args.model)
 
-    tok_s, total_s, failures = [], [], 0
+    tok_s, total_s, rt_ms, mb_up, failures = [], [], [], 0.0, 0
     print(f"[bench] {args.runs} runs | model={args.model} | split={args.split} | "
           f"head holds {args.split}/{parts['n_layers']} layers", flush=True)
     for i in range(args.runs):
         prompt = PROMPTS[i % len(PROMPTS)]
         try:
-            r = generate_one(parts, tok, args.peer, args.port, prompt, args.max_new, dev)
+            r = generate_one(parts, tok, args.peer, args.port, prompt, args.max_new, dev, args.timeout)
         except Exception as e:
             failures += 1
             print(f"[bench] run {i+1:2d}/{args.runs} FAILED: {type(e).__name__}: {e}", flush=True)
@@ -57,6 +58,7 @@ def main():
         if not ok:
             failures += 1
         tok_s.append(r["tok_s"]); total_s.append(r["total_s"])
+        rt_ms.append(r["rt_ms_avg"]); mb_up += r["mb_up"]
         snippet = " ".join(r["text"].split())[:60]
         print(f"[bench] run {i+1:2d}/{args.runs} {'OK   ' if ok else 'EMPTY'} "
               f"{r['n_tokens']:3d} tok  {r['tok_s']:6.2f} tok/s  {r['total_s']:4.1f}s | {snippet}", flush=True)
@@ -76,6 +78,8 @@ def main():
               f"min {min(tok_s):.2f}  max {max(tok_s):.2f}", flush=True)
         print(f"[bench] total latency: p50 {statistics.median(total_s):.2f}s  "
               f"p95 {pctl(total_s, 95):.2f}s", flush=True)
+        print(f"[bench] edge health: rt/step avg {statistics.mean(rt_ms):.1f}ms  "
+              f"total {mb_up:.1f}MB up over {len(tok_s)} generations", flush=True)
     print(f"[bench] RESULT: {'PASS' if failures == 0 else 'FAIL'}", flush=True)
     raise SystemExit(0 if failures == 0 else 1)
 

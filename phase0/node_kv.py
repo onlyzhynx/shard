@@ -9,9 +9,17 @@ tail: python node_kv.py --role tail --split 24 --port 29501
 head: python node_kv.py --role head --split 24 --peer 172.17.0.3 --port 29501 --prompt "..."
 """
 
-import argparse, socket, struct, pickle, time
+import argparse, os, socket, struct, pickle, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+# transport-layer errors we treat as "edge is dead/frozen" (socket.timeout and
+# every ConnectionError subclass are OSError, so this one tuple covers them all).
+EDGE_ERRORS = (OSError, EOFError)
+
+
+class TransportError(Exception):
+    """a pipeline edge died or stalled; carries context, never a bare hang."""
 
 
 def _recvall(sock, n):
@@ -26,6 +34,7 @@ def _recvall(sock, n):
 def send_msg(sock, obj):
     data = pickle.dumps(obj)
     sock.sendall(struct.pack("!Q", len(data)) + data)
+    return 8 + len(data)            # bytes on the wire, for edge instrumentation
 
 def recv_msg(sock):
     (n,) = struct.unpack("!Q", _recvall(sock, 8))
@@ -80,34 +89,49 @@ def run_layers(h, parts, cache, start):
     return h
 
 
-def generate_one(parts, tok, peer, port, prompt, max_new, dev):
+def generate_one(parts, tok, peer, port, prompt, max_new, dev, timeout=30.0):
     """one full generation over a fresh connection (=> fresh caches on both
-    nodes). returns the decoded text plus timing. opens and closes its own
-    socket so it can be called in a loop against a persistent tail."""
+    nodes). returns the decoded text plus timing + edge health. opens and closes
+    its own socket so it can be called in a loop against a persistent tail.
+
+    every edge round-trip is bounded by `timeout`: a dead OR frozen tail raises
+    TransportError with context (which step, why) instead of hanging forever."""
     enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                   add_generation_prompt=True, return_tensors="pt", return_dict=True)
     ids = enc["input_ids"].to(dev)
     cache = DynamicCache()
-    sock = socket.socket(); sock.connect((peer, port))
+    sock = socket.socket(); sock.settimeout(timeout); sock.connect((peer, port))
     out, start, t0, t_prefill = [], 0, time.time(), None
+    bytes_up, rt_ms, step = 0, [], 0
+
+    def edge_exchange(h, abs_start):       # one supervised round-trip through the tail
+        nonlocal bytes_up
+        t = time.time()
+        bytes_up += send_msg(sock, (h.cpu(), abs_start))
+        nxt = recv_msg(sock)
+        rt_ms.append((time.time() - t) * 1e3)
+        return nxt
+
     try:
         with torch.no_grad():
             # prefill the whole prompt
             h = run_layers(parts["embed"](ids), parts, cache, start)
-            send_msg(sock, (h.cpu(), start))
-            nxt = recv_msg(sock)
+            nxt = edge_exchange(h, start)
             t_prefill = time.time()
             start += ids.shape[1]
             out.append(nxt)
             # decode one token at a time
-            for _ in range(max_new - 1):
+            for step in range(1, max_new):
                 if nxt == tok.eos_token_id:
                     out.pop(); break
                 h = run_layers(parts["embed"](torch.tensor([[nxt]], device=dev)), parts, cache, start)
-                send_msg(sock, (h.cpu(), start))
-                nxt = recv_msg(sock)
+                nxt = edge_exchange(h, start)
                 start += 1
                 out.append(nxt)
+    except EDGE_ERRORS as e:
+        kind = "timed out" if isinstance(e, socket.timeout) else "dropped"
+        raise TransportError(f"tail {peer}:{port} {kind} at decode step {step} "
+                             f"(after {timeout:.0f}s budget) -- {type(e).__name__}: {e}") from e
     finally:
         sock.close()
     if out and out[-1] == tok.eos_token_id:
@@ -120,6 +144,10 @@ def generate_one(parts, tok, peer, port, prompt, max_new, dev):
         "decode_s": decode_s,
         "total_s": time.time() - t0,
         "tok_s": len(out) / decode_s if decode_s > 0 else 0.0,
+        "hops": len(rt_ms),
+        "rt_ms_avg": (sum(rt_ms) / len(rt_ms)) if rt_ms else 0.0,
+        "rt_ms_max": max(rt_ms) if rt_ms else 0.0,
+        "mb_up": bytes_up / 1e6,
     }
 
 
@@ -132,6 +160,8 @@ def main():
     ap.add_argument("--port", type=int, default=29501)
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=64)
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="per-edge round-trip budget (s); exceed it => clean fail, never a hang")
     args = ap.parse_args()
     dev = "cuda"
     parts = load_parts(args.model, args.split, args.role)
@@ -139,29 +169,45 @@ def main():
     if args.role == "tail":
         srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", args.port)); srv.listen(1)
-        print(f"[tail] listening on :{args.port}", flush=True)
+        print(f"[tail] listening on :{args.port} (edge timeout {args.timeout:.0f}s)", flush=True)
         while True:
-            conn, addr = srv.accept(); print(f"[tail] head connected from {addr}", flush=True)
-            cache = DynamicCache()
+            conn, addr = srv.accept(); conn.settimeout(args.timeout)
+            print(f"[tail] head connected from {addr}", flush=True)
+            cache = DynamicCache(); steps = 0
             with torch.no_grad():
                 while True:
                     try:
                         h, start = recv_msg(conn)
-                    except (ConnectionError, EOFError):
-                        print("[tail] head gone, waiting for next", flush=True); break
-                    h = run_layers(h.to(dev), parts, cache, start)
-                    h = parts["norm"](h)
-                    nxt = int(parts["lm_head"](h[:, -1, :]).argmax(-1).item())
-                    send_msg(conn, nxt)
+                        h = run_layers(h.to(dev), parts, cache, start)
+                        h = parts["norm"](h)
+                        nxt = int(parts["lm_head"](h[:, -1, :]).argmax(-1).item())
+                        send_msg(conn, nxt)
+                    except EDGE_ERRORS as e:
+                        why = "stalled" if isinstance(e, socket.timeout) else "closed"
+                        print(f"[tail] edge {why} after {steps} steps ({type(e).__name__}); "
+                              f"resetting, waiting for next head", flush=True)
+                        try: conn.close()
+                        except OSError: pass
+                        break
+                    steps += 1
         return
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    print(f"[head] generating against tail {args.peer}:{args.port} ...", flush=True)
-    r = generate_one(parts, tok, args.peer, args.port, args.prompt, args.max_new, dev)
+    print(f"[head] generating against tail {args.peer}:{args.port} (edge timeout {args.timeout:.0f}s) ...", flush=True)
+    try:
+        r = generate_one(parts, tok, args.peer, args.port, args.prompt, args.max_new, dev, args.timeout)
+    except TransportError as e:
+        # unrecoverable edge failure: socket already closed in generate_one's
+        # finally, message already flushed -- die now rather than wait out the
+        # multi-second torch/cuda teardown (which an operator can't tell from a hang).
+        print(f"\n[head] TRANSPORT FAILURE: {e}", flush=True)
+        os._exit(2)
     print(f"\n[head] === OUTPUT ===\n{r['text']}\n", flush=True)
     print(f"[head] {r['n_tokens']} tokens, total {r['total_s']:.1f}s | prefill {r['prefill_s']:.2f}s | "
           f"decode {r['tok_s']:.2f} tok/s (kv-cache, head holds {args.split}/{parts['n_layers']} layers)",
           flush=True)
+    print(f"[head] edge health: {r['hops']} round-trips | rt/step avg {r['rt_ms_avg']:.1f}ms "
+          f"max {r['rt_ms_max']:.1f}ms | {r['mb_up']:.1f}MB up", flush=True)
 
 
 if __name__ == "__main__":
