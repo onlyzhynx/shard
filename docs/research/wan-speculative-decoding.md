@@ -108,3 +108,14 @@ the way, and it has known fixes.
   a cheap draft (P1 first, de-risk vLLM-on-Ada), then tree speculation. Instrumented
   `phase0/specpipe.py` with per-round `draft_ms`/`verify_ms` + an async-ceiling
   readout.
+- **2026-06-16 — P1 de-risked, and it lands.** gpt-oss-20b under vLLM 0.23.0 on a
+  single RTX 4090 (MXFP4, CUDA graphs): **5.1 ms/tok vs transformers' 61.7 ms/tok —
+  a 12× cheaper draft, no training.** The ~60 ms overhead was a transformers limit,
+  not a hardware one. Recomputing the round with a 5.1 ms draft (K=4, draft ≈ 26 ms
+  + verify 224 ms): **~14 tok/s, up from 6.5** — and the round is now *verify-bound*,
+  which is exactly where tree speculation and faster node kernels pay off. Decision:
+  **P1 is the draft path (no EAGLE training needed yet).** Next: integrate a
+  vLLM-served draft into the spec loop (rollback handled by vLLM prefix-caching, so
+  each round re-proposes from the committed prefix cheaply), then (a) tree spec and
+  (b) run the *target* stages under vLLM kernels too, to cut the verify's compute
+  half. Projected with both: 20+ tok/s on consumer GPUs over WAN, output still exact.
