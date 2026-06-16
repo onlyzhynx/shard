@@ -247,3 +247,12 @@ the way, and it has known fixes.
   reset op (--sweep) -- a fresh process can't reconnect because stages hold persistent
   forward-sockets and only re-accept upstream (a known robustness TODO, not a verify bug);
   (3) the draft env is /root/vllmenv (torch 2.11), separate from the default python3.
+
+- **2026-06-16 — warm steady-state: 24.77 tok/s (exceeds the 20 success criterion).**
+  Cold+warm sweep in one coordinator process (reset between gens, graphs reused):
+  cold **18.93 tok/s** (verify 185 ms, includes graph capture), warm **24.77 tok/s**
+  (verify **135 ms**, fully graph-replayed). The verify went 372 -> 135 ms warm (2.75x),
+  taking the 4-separate-box topology **7.83 -> 24.77 tok/s (3.2x)** -- past the 20 tok/s
+  success criterion of this whole track, on consumer GPUs over real WAN, in-house draft,
+  output coherent. The fast verify is the lever that closed the gap the draft (P1) and
+  direct-return opened.
