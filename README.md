@@ -9,15 +9,21 @@ Shard is the inference engine for [c0mpute](https://c0mpute.ai).
 
 ## 100B+ across the swarm
 
-**gpt-oss-120b — 120 billion parameters — served across 4 nodes.** Split 9 layers
-per node across 4× RTX 4090 (~16 GB each, ~64 GB total); no single 24 GB card can
-hold it, four can. Each node loads **only its own block** — the rest of the model
-is never materialized on that node. Coherent output at 6.3 tok/s (4-stage
-pipeline, co-located).
+**gpt-oss-120b — 120 billion parameters — served across the swarm.** Split 9
+layers per node across 4× RTX 4090 (~16 GB each, ~64 GB total); no single 24 GB
+card can hold it, four can. Each node loads **only its own block** — the rest of
+the model is never materialized on that node.
 
-A model far too big for any consumer GPU, running across several — the whole
-point, proven. Combined with the WAN transport below (proven Norway → North
-Carolina at ~115 ms), this is the path to an internet-scale swarm.
+| Setup | Result |
+|-------|--------|
+| 4 nodes, co-located | coherent output, 6.3 tok/s |
+| **4 nodes, 2 machines, ~95 ms WAN** (Washington ↔ Quebec) | **coherent output, 3.5 tok/s** |
+
+That second row is the whole thesis in one line: a frontier-size model, far too
+big for any consumer GPU, served across machines on different networks over the
+open internet — the activations physically crossing the continent on every token.
+Plain decode is latency-bound (3.5 tok/s); speculative decoding (below) is what
+turns that into usable throughput, and is the next thing to layer on at this scale.
 
 ## Status
 
