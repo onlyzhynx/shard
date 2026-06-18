@@ -15,6 +15,7 @@ weights/
 # Personal/ops control + deploy scratch — NOT part of the Shard protocol
 phase0/fleet.py
 phase0/finish_deploy.py
+phase0/launch_ring.py
 phase0/flashinfer_cache.tgz
 RESULT_kv.txt
 RESULT_spec.txt

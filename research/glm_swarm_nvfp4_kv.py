@@ -190,7 +190,7 @@ def run_block(layers, start_pos, h, vcfg):
             h = L.forward(h, start_pos, pe)
     return h
 
-def stage(layer_ids, port, nxt=None):
+def stage(layer_ids, port, nxt=None, ring=False):
     vcfg = _vllm_ctx()
     layers = [Layer(i) for i in layer_ids]
     mem = torch.cuda.memory_allocated() / 1e9
@@ -215,7 +215,10 @@ def stage(layer_ids, port, nxt=None):
                     if fwd is None:
                         host, p = nxt.rsplit(":", 1); fwd = socket.create_connection((host, int(p)))
                         fwd.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    send_msg(fwd, sp, h); _, back = recv_msg(fwd); send_msg(conn, sp, back)
+                    if ring:
+                        send_msg(fwd, sp, h)                                       # ring: fire-forward, the
+                    else:                                                          # tail's --next IS the coord
+                        send_msg(fwd, sp, h); _, back = recv_msg(fwd); send_msg(conn, sp, back)  # relay-back
                 else:
                     send_msg(conn, sp, h)
         except (ConnectionError, EOFError):
@@ -256,8 +259,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="role", required=True)
     p = sub.add_parser("stage"); p.add_argument("--layers", type=int, nargs="+", required=True)
     p.add_argument("--port", type=int, default=29600); p.add_argument("--next", default=None)
+    p.add_argument("--ring", action="store_true")   # fire-forward; tail's --next is the coord's return ep
     p = sub.add_parser("coord"); p.add_argument("--stage", required=True)
     p.add_argument("--prompt", default="The capital of France is"); p.add_argument("--max-new", type=int, default=16)
     a = ap.parse_args()
-    if a.role == "stage": stage(a.layers, a.port, a.next)
+    if a.role == "stage": stage(a.layers, a.port, a.next, a.ring)
     else: coord(a.stage, a.prompt, a.max_new)
