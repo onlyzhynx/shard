@@ -35,6 +35,7 @@ from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
 from fastverify import FastVerify
 from ngram_draft import NgramDrafter
+from specsample import Sampler
 import os
 try:                                                    # PROVE: opt-in signed per-stage receipts
     from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
@@ -175,6 +176,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    sampler = Sampler(device=dev)                         # greedy until a reset sets temp>0 (tail-relay path)
     node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
     signer = None
     print(f"[s{stage}] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, edge timeout {timeout:.0f}s"
@@ -195,6 +197,8 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     msg = recv_msg(conn)
                     if msg["op"] == "reset":
                         fv.reset(); first = True
+                        sampler = Sampler(temp=msg.get("temp", 0.0), top_p=msg.get("top_p", 1.0),
+                                          top_k=msg.get("top_k", 0), seed=msg.get("seed", 0), device=dev)
                         if RECEIPTS:                     # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), parts["lo"], parts["hi"])
@@ -219,20 +223,31 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                         x = parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
                     else:
                         x = msg["h"].to(dev)
+                    is_pf = ("par" not in msg) and (first or msg.get("prefill"))
+                    draft = msg.get("draft")               # the K proposed tokens, for the tail's sampler
+                    if draft is None and "token_ids" in msg and not is_pf and "par" not in msg:
+                        draft = msg["token_ids"][1:]       # head derives them: chunk = [carry] + K drafts
                     if "par" in msg:                       # TREE verify (fixed-topology graph)
                         h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                     else:                                  # LINEAR verify (prefill, then graphed decode)
-                        is_pf = first or msg.get("prefill")
                         h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                     if is_tail:
                         # prefill: only the last token's logit is consumed -> avoid a [chunk x vocab] OOM
-                        h = parts["norm"](h[:, -1:] if ("par" not in msg and is_pf) else h)
-                        send_msg(conn, parts["lm_head"](h).argmax(-1)[0].tolist())
+                        h = parts["norm"](h[:, -1:] if is_pf else h)
+                        logits = parts["lm_head"](h)
+                        if is_pf:                          # prefill: the single first new token (greedy=argmax)
+                            send_msg(conn, [sampler.sample_logits(logits[0, -1])])
+                        elif draft is None:                # tree / no-draft decode: per-position (greedy=argmax)
+                            send_msg(conn, logits.argmax(-1)[0].tolist() if sampler.greedy
+                                     else [sampler.sample_logits(logits[0, i]) for i in range(logits.shape[1])])
+                        else:                              # lossless speculative sampling over the K+1 logits
+                            send_msg(conn, sampler.accept(logits[0], draft))
                     else:
                         fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"], "prefill": msg.get("prefill")}
                         if "par" in msg: fwd["par"] = msg["par"]; fwd["dep"] = msg["dep"]
+                        if draft is not None: fwd["draft"] = draft
                         if g: fwd["gather"] = g
                         send_msg(nxt_sock, fwd)
                         if not direct:
@@ -273,6 +288,7 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(8)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    sampler = Sampler(device=dev)                         # greedy until a reset sets temp>0
     node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
     signer = None
     print(f"[tail] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, direct return, edge timeout {timeout:.0f}s"
@@ -320,6 +336,8 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
             try:
                 if msg["op"] == "reset":
                     fv.reset(); first = True
+                    sampler = Sampler(temp=msg.get("temp", 0.0), top_p=msg.get("top_p", 1.0),
+                                      top_k=msg.get("top_k", 0), seed=msg.get("seed", 0), device=dev)
                     if RECEIPTS:
                         signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                msg.get("job_id", "job"), parts["lo"], parts["hi"])
@@ -333,10 +351,11 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 if g:
                     fv.tree_gather(g[0], g[1])
                 x = msg["h"].to(dev)
+                is_pf = ("par" not in msg) and (first or msg.get("prefill"))
+                draft = msg.get("draft")                    # the K proposed tokens (for the sampler's accept)
                 if "par" in msg:                           # TREE verify
                     h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                 else:
-                    is_pf = first or msg.get("prefill")
                     h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
                     if RECEIPTS and signer is not None:    # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
@@ -345,8 +364,14 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                     # at chunk 4096 and OOMs a 24GB tail at long context. decode needs all K+1 logits.
                     if is_pf:
                         h = h[:, -1:]
-                h = parts["norm"](h)
-                send_msg(ret, parts["lm_head"](h).argmax(-1)[0].tolist())
+                logits = parts["lm_head"](parts["norm"](h))
+                if is_pf:                                  # prefill: the single first new token (greedy=argmax)
+                    send_msg(ret, [sampler.sample_logits(logits[0, -1])])
+                elif draft is None:                        # tree / no-draft decode: per-position (greedy=argmax)
+                    send_msg(ret, logits.argmax(-1)[0].tolist() if sampler.greedy
+                             else [sampler.sample_logits(logits[0, i]) for i in range(logits.shape[1])])
+                else:                                      # lossless speculative SAMPLING over the K+1 logits
+                    send_msg(ret, sampler.accept(logits[0], draft))
             except EDGE_ERRORS as e:                        # return channel gone -> re-accept it, keep pred + KV
                 print(f"[tail] return edge ({type(e).__name__}); dropping return channel, keeping predecessor+KV", flush=True)
                 try: ret.close()
@@ -537,7 +562,8 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
 
 def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
                     ignore_eos=False, prefill_chunk=0, draft_ctx=0, on_commit=None, reasoning=None, system=None,
-                    max_ctx=0, local_draft=None):
+                    max_ctx=0, local_draft=None, temp=0.0, top_p=1.0, top_k=0, seed=0, prefill_depth=8,
+                    resume_ids=None, resumable=False):
     """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
     throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
     GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
@@ -565,30 +591,53 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
     enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True, **ct_kw)
     prompt_ids = enc["input_ids"][0].tolist()
+    # FAULT-TOLERANCE RESUME: re-prefill prompt + the already-committed tokens onto a freshly-healed
+    # ring, then continue decoding -- so a mid-request node death costs ONE re-prefill, not a restart,
+    # and the user's committed output is preserved (continuation, not regeneration). gen_ids is the
+    # full context to rebuild every stage's KV over; out is seeded with the recovered tokens.
+    resume_ids = list(resume_ids or [])
+    gen_ids = prompt_ids + resume_ids
     if max_ctx:                                                   # never let prompt+generation exceed the window
-        max_new = max(16, min(max_new, max_ctx - len(prompt_ids) - 16))
+        max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []
-    t_draft = t_recv = 0.0
+    t_draft = t_recv = 0.0; prefill_s = 0.0
     try:
-        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
+        send_msg(pipe_sock, {"op": "reset", "temp": temp, "top_p": top_p, "top_k": top_k, "seed": seed})
+        recv_msg(rx)
         # prefill: one shot, or chunked (long prompts) with the prefill flag so stages run flex
-        if prefill_chunk and len(prompt_ids) > prefill_chunk:
-            rr = None
-            for i in range(0, len(prompt_ids), prefill_chunk):
-                send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk],
+        t_pf = time.time()
+        if prefill_chunk and len(gen_ids) > prefill_chunk:
+            # PIPELINED prefill: keep prefill_depth chunks in flight so the stages OVERLAP -- stage 0
+            # prefills chunk c+1 while stage 1 prefills chunk c, etc. Each stage's chunk c+1 only needs
+            # that stage's OWN chunk-c KV (already local, causal), so prefill is embarrassingly
+            # pipelineable; the win is ~Nstage-fold over the old one-chunk-at-a-time path, which waited a
+            # full ring traversal per chunk (zero overlap = the ~10-min/100k TTFT). Results come back in
+            # FIFO order on rx; only the final chunk's last token (cur) is consumed. depth bounds how many
+            # big inter-stage activation messages are in flight (backpressure self-regulates the ring).
+            starts = list(range(0, len(gen_ids), prefill_chunk))
+            def _send_pf(i):
+                send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk],
                                      "start": i, "prefill": True})
+            d = min(max(prefill_depth, 1), len(starts)); sent = 0; rr = None
+            while sent < d:
+                _send_pf(starts[sent]); sent += 1
+            for _ in range(len(starts)):
                 rr = recv_msg(rx)
+                if sent < len(starts):
+                    _send_pf(starts[sent]); sent += 1
             cur = rr[-1]
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
+            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0})   # prefill
             cur = recv_msg(rx)[-1]
-        pos = len(prompt_ids)
-        out = [cur]
-        if on_commit: on_commit({"phase": "prefilled", "prompt_tokens": len(prompt_ids)})
+        prefill_s = time.time() - t_pf
+        pos = len(gen_ids)
+        out = resume_ids + [cur]                    # preserve recovered tokens; cur = next after them
+        if on_commit: on_commit({"phase": "prefilled", "prompt_tokens": len(prompt_ids),
+                                 "resume_tokens": len(resume_ids), "prefill_s": prefill_s})
         inflight = []                              # FIFO of (start_pos, drafts) sent but not yet read
         discard = 0                                # stale post-divergence results still to drain
         send_pos = pos                             # absolute pos where the next chunk writes
-        dprefix = prompt_ids + [cur]               # draft-server query prefix; dprefix[-1] == next tail_tok
+        dprefix = gen_ids + [cur]                  # draft-server query prefix; dprefix[-1] == next tail_tok
         valid = accepted = wasted = 0
         t0 = time.time()
         done = False
@@ -633,18 +682,95 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         while inflight:                                               # drain unread results -> sockets clean for next gen
             recv_msg(rx); inflight.pop(0)
     except EDGE_ERRORS as e:
+        if resumable:                          # a node died: hand the committed tokens back so the control
+            committed = out if out else list(resume_ids)   # plane can heal the ring + resume (not restart)
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}",
+                    "output_ids": committed, "n_tokens": len(committed),
+                    "text": tok.decode(committed, skip_special_tokens=True)}
         raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
     dt = time.time() - t0
     if eos in out:
         out = out[:out.index(eos)]
     return {
+        "ok": True,
         "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
         "mean_accept": accepted / max(valid, 1),
         "toks_per_traversal": (accepted + valid) / max(valid, 1),
         "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "depth": depth, "K": K,
         "draft_ms": t_draft / max(valid, 1) * 1000, "recv_ms": t_recv / max(valid, 1) * 1000,
+        "prefill_s": prefill_s, "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
         "output_ids": out,
     }
+
+
+def sample_distribution_test(pipe_sock, tok, prompt, timeout, ret_sock, local_draft, K, n_draws=2000,
+                             temp=1.0, top_p=1.0, top_k=0, seed=0, prefill_chunk=0, reasoning=None,
+                             stops=12, step=8, n_per=140):
+    """On-swarm LOSSLESSNESS proof for speculative SAMPLING. At each of `stops` content positions, draw
+    n_per iid samples of the next token THREE ways and compare the empirical distributions:
+      PLAIN  — send a 1-token chunk (K=0 accept) -> a pure target sample from the temp/top-p dist.
+      SPEC   — send [carry]+K n-gram drafts -> the speculative-sampling accept's committed first token.
+      PLAIN2 — a second plain block -> calibrates the Monte-Carlo noise floor (two finite samples of the
+               SAME distribution still differ by ~this much), so TV(spec,plain) is judged against it.
+    Both PLAIN and SPEC must be distributed as p(next | context). Draws don't advance the KV (they
+    overwrite scratch slots), so they're pipelined (depth chunks in flight) and fast; between stops we
+    advance `step` tokens. We sweep positions so some land HIGH-ENTROPY (where the rejection/residual
+    sampling actually does work and a distribution test is discriminating). Verdict aggregates over the
+    high-entropy stops: if mean TV(spec,plain) ~ mean TV(plain,plain) noise floor, sampling is lossless
+    on the real gpt-oss-120B distribution end-to-end through the WAN ring."""
+    import collections, math
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    ct_kw = {"reasoning_effort": reasoning} if reasoning else {}
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True,
+                                  return_tensors="pt", return_dict=True, **ct_kw)
+    prompt_ids = enc["input_ids"][0].tolist()
+    send_msg(pipe_sock, {"op": "reset", "temp": temp, "top_p": top_p, "top_k": top_k, "seed": seed}); recv_msg(rx)
+    if prefill_chunk and len(prompt_ids) > prefill_chunk:
+        for i in range(0, len(prompt_ids), prefill_chunk):
+            send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk], "start": i, "prefill": True})
+            cur = recv_msg(rx)[-1]
+    else:
+        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0, "prefill": True}); cur = recv_msg(rx)[-1]
+    ctx = prompt_ids + [cur]; pos = len(prompt_ids) + 1
+
+    def block(spec, ctx, start, depth=8):                       # n_per pipelined iid draws at a fixed position
+        ds = local_draft.propose(ctx, K) if spec else []
+        msg = {"op": "verify", "token_ids": ([ctx[-1]] + ds) if spec else [ctx[-1]], "start": start, "draft": ds}
+        h = collections.Counter(); sent = got = 0
+        while got < n_per:
+            while sent < n_per and sent - got < depth:
+                send_msg(pipe_sock, msg); sent += 1
+            h[recv_msg(rx)[0]] += 1; got += 1
+        return h
+
+    def entropy(h):
+        n = sum(h.values()); return -sum((c / n) * math.log2(c / n) for c in h.values() if c)
+
+    def tvd(a, b):
+        ks = set(a) | set(b); na, nb = sum(a.values()), sum(b.values())
+        return 0.5 * sum(abs(a.get(k, 0) / na - b.get(k, 0) / nb) for k in ks)
+
+    rows = []
+    for _ in range(stops):
+        start = pos - 1
+        hp = block(False, ctx, start); hs = block(True, ctx, start); hp2 = block(False, ctx, start)
+        rows.append({"entropy": round(entropy(hp), 3), "tv_spec_plain": tvd(hp, hs),
+                     "tv_plain_plain": tvd(hp, hp2), "distinct": len(set(hp) | set(hs)),
+                     "top": [{"id": int(k), "plain": round(hp[k] / n_per, 3), "spec": round(hs.get(k, 0) / n_per, 3),
+                              "text": tok.decode([k])} for k in sorted(hp, key=lambda k: -hp[k])[:6]]})
+        # advance `step` tokens (greedy-commit the plain mode's mode) to reach the next content position
+        for _ in range(step):
+            send_msg(pipe_sock, {"op": "verify", "token_ids": [ctx[-1]], "start": pos - 1, "draft": []})
+            ctx.append(recv_msg(rx)[0]); pos += 1
+    hi = [r for r in rows if r["entropy"] >= 1.0]               # discriminating (>=1 bit) positions
+    agg = hi if hi else rows
+    mean_spec = sum(r["tv_spec_plain"] for r in agg) / len(agg)
+    mean_noise = sum(r["tv_plain_plain"] for r in agg) / len(agg)
+    return {"temp": temp, "top_p": top_p, "n_per": n_per, "stops": stops, "high_entropy_stops": len(hi),
+            "max_entropy": max(r["entropy"] for r in rows),
+            "mean_tv_spec_vs_plain": mean_spec, "mean_tv_noise_floor": mean_noise,
+            "per_stop": rows}
 
 
 def coordinate_tree(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, timeout, ret_sock=None):
@@ -797,6 +923,19 @@ def main():
     ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
     ap.add_argument("--pipe", action="store_true", help="coordinator: PIPELINED spec-decode (depth chunks in flight; needs --direct-return)")
     ap.add_argument("--depth", type=int, default=4, help="pipelined coordinator: verify chunks in flight")
+    ap.add_argument("--prefill-depth", type=int, default=8, help="pipelined coordinator: PREFILL chunks in flight "
+                    "(overlap prefill across stages; >=nstages fills the pipe -> ~Nstage-fold faster TTFT)")
+    ap.add_argument("--temp", type=float, default=0.0, help="sampling temperature (0=greedy/argmax, exact legacy path); "
+                    ">0 enables LOSSLESS speculative sampling at the tail (temp/top-p/top-k)")
+    ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling cutoff (with --temp>0)")
+    ap.add_argument("--top-k", type=int, default=0, help="top-k sampling cutoff (0=off; with --temp>0)")
+    ap.add_argument("--seed", type=int, default=0, help="tail sampler seed (reproducible sampled runs / receipts)")
+    ap.add_argument("--sample-test", type=int, default=0, help="coordinator: draw N iid next-tokens via PLAIN vs "
+                    "SPECULATIVE sampling and report TV distance (on-swarm losslessness proof); needs --ngram-draft")
+    ap.add_argument("--resume-file", default="", help="coordinator: JSON {output_ids:[...]} of already-committed "
+                    "tokens to RESUME from (re-prefill prompt+committed on a healed ring, continue) — fault tolerance")
+    ap.add_argument("--ft-dump", default="", help="coordinator: run resumable + write {ok,output_ids,...} here on "
+                    "completion OR mid-request node death (exit 3 if a node died), so the control plane can heal+resume")
     ap.add_argument("--compare", action="store_true", help="coordinator: SYNC then PIPE (cold+warm) in ONE process for a clean A/B")
     ap.add_argument("--depths", default="2,4,8", help="--compare: pipe depths to sweep (one process)")
     ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
@@ -880,22 +1019,72 @@ def main():
                 print(f"[coord] dumped receipt run -> {args.dump} | tokens_match_sync={sids == pids}", flush=True)
             print(f"\n[coord] === sample output ===\n{r['text'][:400]}\n", flush=True)
             return
+        if args.sample_test:                               # on-swarm losslessness proof for sampling
+            import json as _json
+            r = sample_distribution_test(pipe_sock, tok, args.prompt, args.timeout, ret_sock, local_draft,
+                                         args.K, temp=(args.temp if args.temp > 0 else 1.0),
+                                         top_p=args.top_p, top_k=args.top_k, seed=args.seed,
+                                         prefill_chunk=args.prefill_chunk, reasoning=(args.reasoning or None),
+                                         n_per=args.sample_test)
+            print(f"\n[SAMPLE-TEST] temp={r['temp']} top_p={r['top_p']} n_per={r['n_per']} stops={r['stops']} "
+                  f"(high-entropy>=1bit: {r['high_entropy_stops']}, max_entropy={r['max_entropy']:.2f} bits)", flush=True)
+            print(f"  mean TV(spec, plain)  over high-entropy stops = {r['mean_tv_spec_vs_plain']:.4f}", flush=True)
+            print(f"  mean TV(plain, plain) noise floor             = {r['mean_tv_noise_floor']:.4f}", flush=True)
+            verdict = "LOSSLESS — spec-sampling distribution == plain sampling within MC noise" \
+                if r['mean_tv_spec_vs_plain'] <= 1.5 * r['mean_tv_noise_floor'] + 0.01 else "MISMATCH"
+            print(f"  VERDICT: {verdict}", flush=True)
+            he = sorted([s for s in r["per_stop"] if s["entropy"] >= 1.0], key=lambda s: -s["entropy"])[:3]
+            for s in he:
+                print(f"  -- stop entropy={s['entropy']:.2f}b tv(spec,plain)={s['tv_spec_plain']:.3f} "
+                      f"tv(plain,plain)={s['tv_plain_plain']:.3f}", flush=True)
+                for t in s["top"]:
+                    print(f"       {repr(t['text'])[:14]:14} plain={t['plain']:.3f} spec={t['spec']:.3f}", flush=True)
+            if args.dump:
+                _json.dump({"test": "spec-sampling-losslessness", "model": args.model, "verdict": verdict, **r},
+                           open(args.dump, "w"))
+                print(f"[coord] dumped sample-test -> {args.dump}", flush=True)
+            return
+        if args.ft_dump:                                   # FAULT-TOLERANT run: resumable, dump partial on node death
+            import json as _json, sys as _sys
+            resume_ids = _json.load(open(args.resume_file)).get("output_ids", []) if args.resume_file else None
+            r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, args.K, args.max_new, args.timeout,
+                                args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
+                                draft_ctx=args.draft_ctx, local_draft=local_draft, reasoning=(args.reasoning or None),
+                                temp=args.temp, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
+                                prefill_depth=args.prefill_depth, resume_ids=resume_ids, resumable=True)
+            _json.dump({"ok": r.get("ok", False), "output_ids": r.get("output_ids", []),
+                        "n_tokens": r.get("n_tokens", 0), "text": r.get("text", ""),
+                        "error": r.get("error"), "tok_s": round(r.get("tok_s", 0.0), 2),
+                        "prefill_s": round(r.get("prefill_s", 0.0), 2),
+                        "resume_tokens": (len(resume_ids) if resume_ids else 0)}, open(args.ft_dump, "w"))
+            status = "OK" if r.get("ok") else f"NODE-DEATH (committed {r.get('n_tokens', 0)} tok)"
+            print(f"[coord] FT run {status} -> {args.ft_dump} | {r.get('n_tokens',0)} tok"
+                  f"{' | '+r['error'] if r.get('error') else ''}", flush=True)
+            print(f"\n[coord] === OUTPUT ({r.get('n_tokens',0)} tok) ===\n{r.get('text','')[:600]}\n", flush=True)
+            _sys.exit(0 if r.get("ok") else 3)
         if args.pipe:                                      # PIPELINED coordinator (depth chunks in flight)
             ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
             for kv in ks:
                 r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, kv, args.max_new,
                                     args.timeout, args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
                                     draft_ctx=args.draft_ctx, local_draft=local_draft,
-                                    reasoning=(args.reasoning or None))
-                print(f"[PIPE K={kv} depth={args.depth}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
-                      f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | "
+                                    reasoning=(args.reasoning or None), temp=args.temp, top_p=args.top_p,
+                                    top_k=args.top_k, seed=args.seed, prefill_depth=args.prefill_depth)
+                print(f"[PIPE K={kv} depth={args.depth} temp={args.temp}] {r['tok_s']:.2f} tok/s | "
+                      f"{r['toks_per_traversal']:.2f} tok/traversal | "
+                      f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | prefill {r['prefill_s']:.1f}s | "
                       f"draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms/round", flush=True)
             if args.dump:
                 import json, hashlib
                 ids = r["output_ids"]
                 rec = {"prompt": args.prompt, "model": args.model, "K": ks[-1], "depth": args.depth,
-                       "tok_s_warm": round(r["tok_s"], 2), "n_tokens": r["n_tokens"], "output_ids": ids,
-                       "output_text": r["text"],
+                       "tok_s_warm": round(r["tok_s"], 2), "n_tokens": r["n_tokens"],
+                       "prompt_tokens": r.get("prompt_tokens"), "prefill_s": round(r.get("prefill_s", 0.0), 2),
+                       "prefill_depth": args.prefill_depth, "prefill_chunk": args.prefill_chunk,
+                       "temp": args.temp, "top_p": args.top_p, "top_k": args.top_k, "seed": args.seed,
+                       "mean_accept": round(r["mean_accept"], 3), "toks_per_traversal": round(r["toks_per_traversal"], 3),
+                       "decode": ("greedy (exact)" if args.temp <= 0 else f"sampling temp={args.temp} top_p={args.top_p}"),
+                       "output_ids": ids, "output_text": r["text"],
                        "output_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
                 json.dump(rec, open(args.dump, "w"))
                 print(f"[coord] dumped run -> {args.dump} (sha256 {rec['output_sha256'][:16]}..)", flush=True)
