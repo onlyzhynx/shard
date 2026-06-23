@@ -8,12 +8,15 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
 **E**ngineering (shard repo) · **R**esearch · **I**ntegration (c0mpute repo / not this engine).
 
 ## 1. Latency (what users feel)
-- ◑ **E — Time-to-first-token at long ctx. PARTIAL (2026-06-23).** Pipelined prefill (`prefill_depth` chunks
-  in flight, stages overlap) landed: **30k TTFT 105.6→55.0s (1.9×)**, **110k 226.8→193.3s (1.17×)**; even-split
-  N=4 + pipelining take 110k from ~556s (old 18/9/9) to 193s. **The <60s bar is NOT met on 4×4090** — the 100k
-  case is handoff-bound (the 24MB/chunk inter-stage activation send is *synchronous*, stalling overlap at long
-  ctx). Next: **async inter-stage send** + more stages (the speedup scales with stage count). fp8/int8 KV is a
-  decode/memory win, not a prefill-compute one. [receipt](receipts/prefill-ttft-20260623.json).
+- ◑ **E — Time-to-first-token at long ctx. ASYNC SEND DONE (2026-06-23); 110k is now compute-bound.** Pipelined
+  prefill landed last session (`prefill_depth` chunks in flight) but was handoff-bound at long ctx (synchronous
+  24MB/chunk send). **Async inter-stage send now fixes the handoff** (per-stage `_AsyncSender` thread + 32MB socket
+  buffers): same-ring A/B → **30k 153.3→60.8s (2.52×)**, **110k 245.9→210.0s (1.17×)**. At 30k the prefill is
+  handoff-bound so async restores the pipeline overlap (2.5×); at 110k it's **compute-bound** (each chunk attends
+  to ~110k of accumulated context, dwarfing the handoff) so async helps modestly. **`<60s@110k` is therefore a
+  COMPUTE wall on 4×4090, not handoff** — more stages lowers per-stage compute (a real but bounded lever, untested
+  this session). The async win would be LARGER on thin consumer uplinks (handoff-dominated). fp8/int8 KV is a
+  decode/memory win, not a prefill-compute one. [receipt](receipts/async-send-ttft-20260623.json).
 - 🟡 **E — Decode on NOVEL generation. NOT REACHABLE on this WAN topology (researched 2026-06-23).** 28 tok/s is
   copy/retrieval; novel prose at 100k is ~2–4 tok/s and **≥20 tok/s on novel gen at 100k is not achievable with
   any drop-in draft over this ring** — the wall is g×RTT and novel text caps g low; EAGLE/EAGLE-3/Medusa/MTP are
@@ -29,7 +32,19 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
   at parity: deterministic-drafter rejection sampling at the tail (`shard/specsample.py`), output distribution ==
   the target's temp/top-p distribution (math TV 0.0053; on-swarm TV(spec,plain)==noise floor; 3 coherent sampled
   generations). temp≤0 stays bit-identical to greedy. [receipt](receipts/sampling-lossless-20260623.json).
-- 🔴 **E — Concurrent request batching.** One stream at a time today; throughput economics need continuous batching.
+- ◑ **E — Concurrent request batching. PRIMITIVE BUILT + crux isolated (2026-06-23).** The batch=1 fixed-shape
+  CUDA-graph verify was lifted to B streams (`phase0/batchverify.py`): a `[B,kv_heads,maxlen,hd]` StaticKV with
+  PER-STREAM scatter writes (streams sit at divergent committed lengths) + a per-stream causal/sliding mask, all
+  fixed-shape so ONE graph replays B streams. **The graph primitive is correct** (B=1 bit-exact vs FastVerify,
+  intra-batch deterministic, eager==graph) and gives **real aggregate throughput on a real gpt-oss-120B block:
+  1.60×@B4, 2.10×@B8** (fast/batched-MoE) or **1.24×@B8** (lossless/per-stream-MoE). A remaining gap to full
+  lossless batching: the mxfp4 MoE kernel (`matmul_ogs`) is *deterministically* token-count-non-invariant
+  (B=1-vs-B=2 MLP outputs diverge reproducibly) — the SAME root cause as the documented cross-K FP non-determinism.
+  So the crux the goal flagged is now precisely characterized: it's the **MoE kernel, not the CUDA graph**. (The
+  practical magnitude of that drift on real activations is unresolved — the single-box test uses random block
+  inputs, which are pathological; a ring test with real activations is the clean measurement.) Lossless paths:
+  per-stream MoE (1.24×, attention stays batched) or a token-count-invariant MoE kernel.
+  [receipt](receipts/batched-verify-20260623.json).
 - 🟡 **I — >1 model in the catalog** (incl. an uncensored one — the actual differentiator). Manifest/fetch supports it.
 
 ## 3. Reliability (survives a real consumer-GPU swarm)

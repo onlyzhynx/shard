@@ -26,7 +26,7 @@ piggybacked, so a round costs exactly one round-trip end to end.
       --next 127.0.0.1:29501 --draft DRAFT --device cuda:0 --draft-device cuda:1 --adaptive
 """
 
-import argparse, socket, time
+import argparse, socket, time, threading, queue
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 import wire
@@ -48,6 +48,50 @@ NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 def _act_digest(t):
     """A deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
+
+
+SOCK_BUF = 32 << 20   # 32MB SO_SNDBUF/SO_RCVBUF: a ~24MB prefill-chunk activation buffers in-kernel,
+                      # so a stage's forward send returns without waiting for the next stage to drain it.
+SYNC_SEND = bool(os.environ.get("SHARD_SYNC_SEND"))   # force the OLD synchronous forward send (A/B baseline)
+
+
+class _AsyncSender:
+    """Decouple a stage's compute from the synchronous inter-stage WAN send. At PREFILL the forward
+    activation is ~24MB/chunk; with a plain send_msg the stage blocks until the next stage drains it
+    (the socket buffer fills), so pipelined prefill collapses at long context -- one stage stalls the
+    whole chain (the 1.17Ã—@110k handoff wall). This pushes the send to a background thread draining a
+    FIFO queue: the compute thread enqueues and immediately processes the next chunk, so stages truly
+    OVERLAP and TTFT approaches the m/(m+p-1) pipeline ceiling. FIFO order is preserved, so the tail's
+    results still return to the coordinator in send order. DIRECT-return only (the stage never reads
+    back on this socket). A send error is captured and re-raised on the next put(), so the existing
+    `except EDGE_ERRORS` edge supervision resets the link exactly as before."""
+    def __init__(self, sock):
+        self.sock = sock
+        self.q = queue.Queue(maxsize=64)
+        self.error = None
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        while True:
+            obj = self.q.get()
+            if obj is None:
+                return
+            if self.error is not None:
+                continue                       # link already failed; drain+discard while the loop tears down
+            try:
+                send_msg(self.sock, obj)
+            except Exception as e:             # surfaced to the serve loop on the next put() -> edge reset
+                self.error = e
+
+    def put(self, obj):
+        if self.error is not None:
+            raise self.error
+        self.q.put(obj)
+
+    def close(self):
+        try: self.q.put_nowait(None)
+        except Exception: pass
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
@@ -168,12 +212,32 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     verify = a decode round (graphed). rollback is implicit -- a round writes at `start`
     (the committed length), overwriting the prior round's rejects."""
     is_tail = stage == nstages - 1
-    nxt_sock = None
+    nxt_sock = None; sender = None
+    host = port = None
     if not is_tail:
         host, port = nxt.split(":")
-        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port)))
+
+    def mk_fwd():                                            # (re)build the forward link (+ async sender in direct mode)
+        nonlocal nxt_sock, sender
+        s = socket.socket(); s.settimeout(timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCK_BUF)   # buffer a full ~24MB prefill chunk in-kernel
+        s.connect((host, int(port)))
+        nxt_sock = s
+        # async send: decoupled forward (no read-back in direct mode). SHARD_SYNC_SEND=1 forces the old
+        # synchronous path -> the clean A/B baseline (reproduces last session's handoff-bound 193s@110k).
+        sender = _AsyncSender(s) if (direct and not SYNC_SEND) else None
+
+    def fwd_send(o):                                         # async in direct mode, synchronous otherwise
+        if direct and sender is not None:
+            sender.put(o)
+        else:
+            send_msg(nxt_sock, o)
+
+    if not is_tail:
+        mk_fwd()
         print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCK_BUF)     # accepted conns inherit it: drain big chunks fast
     srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
     sampler = Sampler(device=dev)                         # greedy until a reset sets temp>0 (tail-relay path)
@@ -185,7 +249,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
         if not is_tail and nxt_sock is None:                 # forward link dropped (coordinator churn) -> rebuild it;
             for _ in range(60):                              # closing it made the NEXT stage drop its link too, so the
                 try:                                         # whole ring re-handshakes fresh and a new coordinator can drive it
-                    nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port))); break
+                    mk_fwd(); break
                 except OSError: time.sleep(0.5)
             print(f"[s{stage}] forward link rebuilt -> {nxt}" if nxt_sock else f"[s{stage}] relink FAILED", flush=True)
         conn, addr = srv.accept(); conn.settimeout(timeout)
@@ -203,7 +267,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), parts["lo"], parts["hi"])
                         if nxt_sock:
-                            send_msg(nxt_sock, msg)
+                            fwd_send(msg)
                             if not direct: recv_msg(nxt_sock)
                         if not direct: send_msg(conn, "ok")
                         continue
@@ -211,7 +275,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                         if nxt_sock:
-                            send_msg(nxt_sock, msg)       # tail returns the full list to the coordinator (direct)
+                            fwd_send(msg)                 # tail returns the full list to the coordinator (direct)
                             if not direct: send_msg(conn, recv_msg(nxt_sock))
                         else:
                             send_msg(conn, msg.get("receipts", []))
@@ -249,7 +313,7 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                         if "par" in msg: fwd["par"] = msg["par"]; fwd["dep"] = msg["dep"]
                         if draft is not None: fwd["draft"] = draft
                         if g: fwd["gather"] = g
-                        send_msg(nxt_sock, fwd)
+                        fwd_send(fwd)
                         if not direct:
                             send_msg(conn, recv_msg(nxt_sock))
                     verifies += 1
@@ -258,6 +322,8 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     print(f"[s{stage}] edge {why} after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
                     try: conn.close()
                     except OSError: pass
+                    if sender is not None:                    # stop the async sender thread before dropping the link
+                        sender.close(); sender = None
                     if nxt_sock is not None:                  # drop forward link -> ring re-handshakes fresh on re-accept
                         try: nxt_sock.close()
                         except OSError: pass

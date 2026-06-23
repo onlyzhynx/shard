@@ -1,0 +1,24 @@
+{
+  "test": "async inter-stage send — pipelined-prefill TTFT (DEPLOY_READINESS §1)",
+  "date": "2026-06-23",
+  "model": "gpt-oss-120b (mxfp4)",
+  "ring": "N=4 scattered US 4090s — IL(head)·NV·CA·NJ, 4 distinct vast hosts, even 9-layer split",
+  "change": "phase0/specpipe.py serve_spec_fast: a per-stage background _AsyncSender thread drains a FIFO queue, decoupling stage compute from the synchronous ~24MB/chunk WAN forward send (the diagnosed handoff wall); + 32MB SO_SNDBUF/SO_RCVBUF. SHARD_SYNC_SEND=1 forces the OLD synchronous path for a clean same-ring A/B. Direct-return only (the stage never reads back on that socket). FIFO order preserved, so results still return to the coordinator in order. Greedy output unchanged.",
+
+  "ab_same_ring_warm": {
+    "note": "prefill_s from the coordinator (run.json), warm reruns (flex compile is disk-cached); prefill_depth=8, prefill_chunk=4096, K=4, single warm run each",
+    "ctx_30k": {"prompt_tokens": 31750, "sync_prefill_s": 153.31, "async_prefill_s": 60.76, "speedup": 2.52},
+    "ctx_110k": {"prompt_tokens": 114103, "sync_prefill_s": 245.92, "async_prefill_s": 210.02, "speedup": 1.17}
+  },
+
+  "interpretation": "Async send is the right fix for the diagnosed handoff wall and it works: at 30k the prefill is HANDOFF-BOUND (chunks attend to <=30k of context, so the 24MB/chunk send is a large fraction of each stage's time) and synchronous send collapses the pipeline overlap (153s) — async restores it (61s, 2.52×). At 110k the prefill is COMPUTE-BOUND: each chunk attends to up to ~110k of accumulated context, so per-chunk attention dwarfs the 24MB handoff; async still helps but only 1.17× (246->210s). So <60s@110k is a COMPUTE wall on 4090s, not a handoff one — 'more stages' lowers per-stage compute (a real but bounded lever) yet won't reach <60s@110k on this hardware.",
+
+  "honesty": [
+    "Single warm-run measurements (no repeats) — the direction (async >= sync at both contexts) is unambiguous but the exact ratios carry run-to-run noise.",
+    "Datacenter uplinks (~0.8-2.5 Gbps): the 24MB handoff is cheap relative to compute, which is exactly why the 110k win is modest. On real consumer uplinks (~10-50 Mbps up) the handoff dominates, so the async-send win would be LARGER, not smaller — this number is conservative for the permissionless target.",
+    "TRANSPORT: these runs use raw TCP + wire.py (ChaCha20+PSK) to vast-mapped public :29600 ports, NOT the libp2p Go sidecar / per-node identities / NAT traversal (proven separately, JOIN steps 1-2, at parity). The async-send mechanism sits above the wire and applies to a libp2p socket unchanged; absolute TTFT would shift on QUIC + thin uplinks. End-to-end re-validation over libp2p is the documented gap."
+  ],
+
+  "repro": "cd phase0 && SHARD_PSK=$(cat ~/.shard_psk) python3 launch_ngram.py --stages IL,NV,CA,NJ --max-ctx 131072 --prompt-file /root/prompt_long.txt --prefill-chunk 4096 --depth 4 --K 4 --max-new 8   # async (default); add --sync-send for the baseline; --no-launch to rerun warm",
+  "files": ["phase0/specpipe.py", "phase0/launch_ngram.py"]
+}

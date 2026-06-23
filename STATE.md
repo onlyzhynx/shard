@@ -12,6 +12,32 @@ the PROVE primitives are now in; only PAY (c0mpute rails) and the live integrati
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
+## 2026-06-23 (session 3) — batched verify (the batching crux) + async inter-stage send (TTFT)
+Fresh N=4 scattered US ring (IL·NV·CA·NJ, 4 distinct 4090 hosts). Two engine items from
+[docs/DEPLOY_READINESS.md](docs/DEPLOY_READINESS.md):
+
+- **§2 Concurrent request batching — PRIMITIVE BUILT + the crux precisely isolated.** Lifted the batch=1
+  fixed-shape CUDA-graph verify to B streams (`phase0/batchverify.py`): a `[B,kv_heads,maxlen,hd]` StaticKV with
+  PER-STREAM scatter writes (streams sit at divergent committed lengths) + a per-stream causal/sliding mask, all
+  fixed-shape so ONE graph replays B streams. The graph primitive is **correct** (B=1 bit-exact vs FastVerify,
+  intra-batch deterministic, eager==graph) and gives **real aggregate throughput on a real gpt-oss-120B block:
+  1.60×@B4, 2.10×@B8** (fast/batched-MoE) or **1.24×@B8** (lossless/per-stream-MoE). Remaining gap to full lossless
+  batching: the mxfp4 MoE kernel (`matmul_ogs`) is *deterministically* token-count-non-invariant (B=1-vs-B=2 MLP
+  diverges reproducibly) — the SAME root cause as the documented cross-K FP non-determinism. So the crux is the
+  **MoE kernel, not the CUDA graph.** (Practical drift magnitude on real activations is unresolved — the single-box
+  test feeds pathological random block inputs; a ring test is the clean measure.) Meets the scoped-down bar
+  (batched verify at small N, aggregate throughput clearly above single-stream). [receipt](docs/receipts/batched-verify-20260623.json).
+
+- **§1 Async inter-stage send (TTFT) — DONE, measured.** A per-stage background `_AsyncSender` thread + 32MB
+  socket buffers decouple stage compute from the synchronous ~24MB/chunk WAN forward send (the diagnosed handoff
+  wall); `SHARD_SYNC_SEND=1` forces the old path for a clean same-ring A/B. Result (N=4, warm): **30k TTFT
+  153.3→60.8s (2.52×)**, **110k 245.9→210.0s (1.17×)**. At 30k the prefill is handoff-bound, so async restores the
+  pipeline overlap (2.5×); at 110k it's COMPUTE-bound (each chunk attends to ~110k of context), so the 24MB
+  handoff is a small fraction and async helps modestly. **`<60s@110k` is a compute wall on 4090s, not handoff** —
+  more stages is a real but bounded lever. The win would be LARGER on thin consumer uplinks (handoff-dominated).
+  [receipt](docs/receipts/async-send-ttft-20260623.json). (Runs on raw-TCP+wire/PSK, not the libp2p sidecar —
+  mechanism is transport-agnostic; libp2p re-validation is the documented gap.)
+
 ## 2026-06-23 (session 2) — deploy-readiness: lossless sampling, faster TTFT, mid-request fault tolerance
 Three engine-side gaps from [docs/DEPLOY_READINESS.md](docs/DEPLOY_READINESS.md), attacked on a fresh N=4 WAN swarm (WA·MN·NC·NJ, 4 distinct 4090 hosts, even 9-layer split) + an Ohio hot-spare:
 

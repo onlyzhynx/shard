@@ -1,0 +1,40 @@
+{
+  "test": "batched-fast-verify (concurrent request batching — DEPLOY_READINESS §2)",
+  "date": "2026-06-23",
+  "model": "gpt-oss-120b (mxfp4)",
+  "hardware": "1× RTX 4090 (24GB), vast CA host 42248173",
+  "summary": "The batch=1 fixed-shape CUDA-graph verify (fastverify.py) was lifted to B independent streams (batchverify.py): a [B,kv_heads,maxlen,hd] StaticKV with PER-STREAM scatter writes (streams sit at divergent committed lengths) + a per-stream causal/sliding mask, all fixed-shape so ONE graph replays B streams. The graph primitive is mechanically CORRECT and gives real aggregate throughput — but a naive batch dim is NOT lossless on gpt-oss, because the mxfp4 MoE triton kernel (matmul_ogs) is not token-count-invariant. This is the same root cause as the documented cross-K FP non-determinism, and it is the precise crux the deploy goal flagged.",
+
+  "mechanism_correct": {
+    "B1_vs_solo_bit_exact": {"max_abs_hidden_diff": 0.0, "note": "B=1 BatchedFastVerify == solo FastVerify exactly (scatter of a contiguous range == index_copy_; single-row mask == [1,1,kp1,alen])"},
+    "intra_batch_deterministic": {"max_abs_row0_minus_row1_identical_streams": 0.0, "note": "two identical streams in a batch produce identical rows — no cross-stream contamination"},
+    "eager_equals_graph": true,
+    "verdict": "the batched StaticKV scatter, per-stream mask, and CUDA-graph capture/replay are all correct"
+  },
+
+  "aggregate_throughput_block_verify": {
+    "note": "real gpt-oss-120B tail block (4 layers, kp1=K+1=5), batched ONE graph replay vs B sequential solo replays. Throughput is robust to input distribution (it is a timing measurement).",
+    "fast_batched_moe": {
+      "B4": {"solo_ms_per_round": 9.77, "batched_ms_per_round": 6.10, "solo_tok_s": 2047, "batched_tok_s": 3277, "speedup": 1.60},
+      "B8": {"solo_ms_per_round": 18.71, "batched_ms_per_round": 8.91, "solo_tok_s": 2138, "batched_tok_s": 4487, "speedup": 2.10}
+    },
+    "lossless_per_stream_moe": {
+      "B8": {"solo_ms_per_round": 18.85, "batched_ms_per_round": 15.21, "solo_tok_s": 2122, "batched_tok_s": 2629, "speedup": 1.24},
+      "note": "batched attention + per-stream MoE loop; the MoE-weight-reuse win is forfeited, so the gain is modest (batched-attention launch amortization only)"
+    }
+  },
+
+  "moe_not_token_count_invariant": {
+    "what": "the gpt-oss mxfp4 MoE kernel (matmul_ogs) computes per-token results that DETERMINISTICALLY depend on the TOTAL token count it is handed (B×kp1), not just the per-token hidden state — this is a reproducible difference, not noise (intra-batch rows are bit-identical)",
+    "moe_mlp_alone_abs_diff_vs_B1": {"B2": 0.125, "B4": 316.0, "B8": 8.0, "intra_batch_diff": 0.0},
+    "whole_decoder_layer_abs_diff_vs_B1": {"B2": 128.0, "B4": 2048.0},
+    "root_cause": "matmul_ogs grouped/blocked mxfp4 matmul — reduction/tiling varies with token count; same root cause as the documented cross-K FP non-determinism (STATE.md: 'K4 vs K8 first-diff @ token 92'), but a batch dim changes the total token count more than K does"
+  },
+
+  "losslessness_caveat": "Per-stream losslessness could NOT be cleanly measured on a single box: the test feeds RANDOM block-input activations, which push the MoE out-of-distribution and amplify any FP perturbation (hidden diffs ~1e5, token agreement ~77-85% in BOTH fast AND lossless modes — i.e. the single-box disagreement is dominated by random-input chaos, not by the batching path). The deterministic MoE-token-count finding above stands; the magnitude of practical drift on REAL decode activations is unresolved here and needs an end-to-end ring test (real activations, compare each batched stream to its solo decode). The cross-K precedent (one near-tie flip over a long real sequence) suggests it MAY be near-lossless in practice, but that is not yet measured.",
+
+  "conclusion": "The batched-verify CUDA-graph PRIMITIVE is built and proven correct (B=1 bit-exact vs FastVerify, intra-batch deterministic, eager==graph) and delivers real aggregate block-verify throughput: 1.6×@B4 / 2.1×@B8 (fast, batched MoE) or 1.24×@B8 (lossless, per-stream MoE). This MEETS the scoped-down bar (a batched verify at small N with aggregate throughput clearly above single-stream). The remaining gap to full lossless continuous batching is: (1) the mxfp4 MoE kernel is token-count-non-invariant (so the FAST path is FP-perturbed per the cross-K class; a batch-invariant MoE kernel or the lossless per-stream path removes this), and (2) variable batch membership (continuous batching) needs bucketed graphs per B. Honest scope: a measured de-risk + working primitive, not yet a shipped lossless continuous-batching feature.",
+
+  "repro": "on a box with the 120B: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 batchverify_test.py --stage 8 --nstages 9 --B 8 --K 4 --prefixes 120,800,1500,50,300,2000,75,1200 --rounds 1 --max-ctx 4096 [--lossless] ; and moe_batch_test.py / bv_debug.py for the MoE-invariance + B=1-exactness isolation",
+  "files": ["phase0/batchverify.py", "research/batchverify_test.py", "research/moe_batch_test.py", "research/bv_debug.py"]
+}
