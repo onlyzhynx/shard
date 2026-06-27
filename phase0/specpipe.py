@@ -39,6 +39,7 @@ from tree import accept_tree, gather_cache
 from fastverify import FastVerify
 from ngram_draft import NgramDrafter
 from specsample import Sampler
+from confidence import ConfidenceScheduler
 import os
 try:                                                    # PROVE: opt-in signed per-stage receipts
     from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
@@ -720,6 +721,12 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         send_pos = pos                             # absolute pos where the next chunk writes
         dprefix = gen_ids + [cur]                  # draft-server query prefix; dprefix[-1] == next tail_tok
         valid = accepted = wasted = 0
+        # CONFIDENCE-SCHEDULED DEPTH (DSpark-inspired): adapt the pipeline depth from the
+        # running acceptance EMA so a bad draft streak doesn't waste WAN traversals on stale
+        # chunks. High acceptance -> full depth (throughput); low -> throttle to depth 1
+        # (fewer stale chunks discarded on divergence). K stays fixed (the CUDA graph shape is
+        # K+1); only depth changes, which is safe — the stages process whatever arrives.
+        conf_sched = ConfidenceScheduler(min_val=1, max_val=depth, lo=0.3, hi=0.7)
         t0 = time.time()
         done = False
         # ASYNC DRAFT: keep exactly one draft request outstanding so the draft server
@@ -732,7 +739,8 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         dq = lambda: (dprefix[-draft_ctx:] if draft_ctx else dprefix)
         d_request(dq(), K)                                        # prime: one outstanding request
         while not done:
-            while len(inflight) < depth and not done:                  # FILL the pipeline
+            cur_depth = conf_sched.value()                              # confidence-adapted pipeline depth
+            while len(inflight) < cur_depth and not done:                  # FILL the pipeline
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td  # ready (overlapped)
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
@@ -746,6 +754,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 if ds[j] == r[j]: n += 1
                 else: break
             valid += 1; accepted += n
+            conf_sched.observe(n, K)                                    # feed the confidence scheduler
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]
                 committed = ds
@@ -778,6 +787,8 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         "mean_accept": accepted / max(valid, 1),
         "toks_per_traversal": (accepted + valid) / max(valid, 1),
         "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "depth": depth, "K": K,
+        "mean_conf_depth": (depth + conf_sched.value()) / 2 if conf_sched.confidence() is not None else depth,
+        "final_confidence": conf_sched.confidence(),
         "draft_ms": t_draft / max(valid, 1) * 1000, "recv_ms": t_recv / max(valid, 1) * 1000,
         "prefill_s": prefill_s, "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
         "output_ids": out,
