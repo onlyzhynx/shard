@@ -19,6 +19,8 @@ os.environ.setdefault("RANK", "0"); os.environ.setdefault("WORLD_SIZE", "1"); os
 from safetensors import safe_open
 from transformers import AutoConfig
 from transformers.models.minimax_m2 import modeling_minimax_m2 as M
+from torch.nn.attention import sdpa_kernel, SDPBackend                 # SDPA prefill attn (long-ctx OOM fix)
+from torch.nn.attention.bias import causal_lower_right                 # bottom-right causal (NOT is_causal)
 
 dev = "cuda"
 _CTX = None
@@ -31,6 +33,12 @@ I = getattr(cfg, "moe_intermediate_size", None) or cfg.intermediate_size
 EPS = cfg.rms_norm_eps
 GRP = NH // NKV
 SCALING = HD ** -0.5
+# Memory-efficient attention: never materialize the [1,NH,s,total] score matrix (the prefill OOM root —
+# at 10k ctx the naive matmul+fp32-softmax was ~6.5GB/stage). SDPA's flash/efficient/cudnn backends do
+# online softmax, so prefill attn is O(s) not O(s*total). Default ON; M25_SDPA=0 keeps the naive path for A/B.
+M25_SDPA = os.environ.get("M25_SDPA", "1") != "0"
+_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
+                  SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]   # fused first; MATH = never-OOM safety net
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
 ROUTED_SCALE = getattr(cfg, "routed_scaling_factor", 1.0)
 
@@ -147,13 +155,23 @@ class Layer:
             self.kc, self.vc = k, v
         else:
             self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
-        kk = self.kc.repeat_interleave(GRP, dim=1); vv = self.vc.repeat_interleave(GRP, dim=1)
-        total = kk.shape[2]
-        attn = torch.matmul(q, kk.transpose(-1, -2)) * SCALING
-        qpos = torch.arange(s, device=dev).view(s, 1) + start_pos
-        kpos = torch.arange(total, device=dev).view(1, total)
-        attn = attn + torch.where(kpos <= qpos, 0.0, float("-inf")).to(attn.dtype)
-        o = torch.matmul(torch.softmax(attn.float(), -1).to(vv.dtype), vv)
+        total = self.kc.shape[2]
+        if M25_SDPA:
+            # The chunk is the LAST s positions (q at [start_pos, start_pos+s), k at [0, total)). That's a
+            # BOTTOM-RIGHT causal mask — `is_causal=True` is top-left aligned and WRONG here. causal_lower_right
+            # is read by the kernel as a flag (no dense [s,total] tensor), so memory stays O(s). enable_gqa
+            # lets the kernel read the 8-head cache directly (no 6x repeat_interleave expand).
+            with sdpa_kernel(_SDPA_BACKENDS):
+                o = torch.nn.functional.scaled_dot_product_attention(
+                    q, self.kc, self.vc, attn_mask=causal_lower_right(s, total),
+                    scale=SCALING, enable_gqa=True)
+        else:                                                          # naive reference path (M25_SDPA=0, A/B)
+            kk = self.kc.repeat_interleave(GRP, dim=1); vv = self.vc.repeat_interleave(GRP, dim=1)
+            attn = torch.matmul(q, kk.transpose(-1, -2)) * SCALING
+            qpos = torch.arange(s, device=dev).view(s, 1) + start_pos
+            kpos = torch.arange(total, device=dev).view(1, total)
+            attn = attn + torch.where(kpos <= qpos, 0.0, float("-inf")).to(attn.dtype)
+            o = torch.matmul(torch.softmax(attn.float(), -1).to(vv.dtype), vv)
         o = o.transpose(1, 2).reshape(b, s, NH * HD)
         return lin(o, self.o_proj)
 
