@@ -39,6 +39,14 @@ SCALING = HD ** -0.5
 M25_SDPA = os.environ.get("M25_SDPA", "1") != "0"
 _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
                   SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]   # fused first; MATH = never-OOM safety net
+# Static-buffer KV (opt-in): preallocate [1,NKV,MAXLEN,HD] per layer + index_copy_ writes, instead of
+# grow-by-cat. Gives FIXED addresses (the prerequisite for CUDA-graph capture + batched concurrency) and
+# avoids cat fragmentation at long ctx. Default OFF (cat path stays the proven default). MAXLEN is bounded:
+# a full 131072 buffer is ~537MB/layer*2 ≈ 7GB/stage and won't fit beside ~27GB weights on a 32GB 5090, so
+# the cap defaults to 40960 (≈2.2GB/13-layer stage, covers the ≥30k deploy target). Reads stay :total exact
+# with causal_lower_right, so the static path is BIT-IDENTICAL to cat (proven: research/m25_statickv_test.py).
+M25_STATIC_KV = os.environ.get("M25_STATIC_KV", "0") != "0"
+M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
 ROUTED_SCALE = getattr(cfg, "routed_scaling_factor", 1.0)
 
@@ -128,8 +136,13 @@ class Layer:
         self.q_norm = g("self_attn.q_norm.weight"); self.k_norm = g("self_attn.k_norm.weight")
         self.moe, self.gate = _build_moe(li)
         self.kc = self.vc = None
+        if M25_STATIC_KV:                                          # fixed-address buffers (graph/concurrency prereq)
+            self.kc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
+            self.vc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
 
     def reset(self):
+        if M25_STATIC_KV:
+            return                                                # logical reset: writes overwrite at start_pos, reads are :total-bounded (no zeroing needed)
         self.kc = self.vc = None
 
     def _rms(self, x, w):
@@ -149,13 +162,22 @@ class Layer:
             tr, tp = t[..., :rd], t[..., rd:]
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
-        if self.kc is not None and self.kc.shape[2] > start_pos:
-            self.kc = self.kc[:, :, :start_pos, :].contiguous(); self.vc = self.vc[:, :, :start_pos, :].contiguous()
-        if self.kc is None:
-            self.kc, self.vc = k, v
+        if M25_STATIC_KV:                                          # fixed-address write at start_pos; rollback = overwrite + read :total
+            total = start_pos + s
+            if total > M25_KV_MAXLEN:
+                raise RuntimeError(f"context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise it or unset M25_STATIC_KV)")
+            cp = torch.arange(start_pos, total, device=dev)
+            self.kc.index_copy_(2, cp, k); self.vc.index_copy_(2, cp, v)
+            kcur, vcur = self.kc[:, :, :total, :], self.vc[:, :, :total, :]
         else:
-            self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
-        total = self.kc.shape[2]
+            if self.kc is not None and self.kc.shape[2] > start_pos:
+                self.kc = self.kc[:, :, :start_pos, :].contiguous(); self.vc = self.vc[:, :, :start_pos, :].contiguous()
+            if self.kc is None:
+                self.kc, self.vc = k, v
+            else:
+                self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
+            total = self.kc.shape[2]
+            kcur, vcur = self.kc, self.vc
         if M25_SDPA:
             # The chunk is the LAST s positions (q at [start_pos, start_pos+s), k at [0, total)). That's a
             # BOTTOM-RIGHT causal mask — `is_causal=True` is top-left aligned and WRONG here. causal_lower_right
@@ -163,10 +185,10 @@ class Layer:
             # lets the kernel read the 8-head cache directly (no 6x repeat_interleave expand).
             with sdpa_kernel(_SDPA_BACKENDS):
                 o = torch.nn.functional.scaled_dot_product_attention(
-                    q, self.kc, self.vc, attn_mask=causal_lower_right(s, total),
+                    q, kcur, vcur, attn_mask=causal_lower_right(s, total),
                     scale=SCALING, enable_gqa=True)
         else:                                                          # naive reference path (M25_SDPA=0, A/B)
-            kk = self.kc.repeat_interleave(GRP, dim=1); vv = self.vc.repeat_interleave(GRP, dim=1)
+            kk = kcur.repeat_interleave(GRP, dim=1); vv = vcur.repeat_interleave(GRP, dim=1)
             attn = torch.matmul(q, kk.transpose(-1, -2)) * SCALING
             qpos = torch.arange(s, device=dev).view(s, 1) + start_pos
             kpos = torch.arange(total, device=dev).view(1, total)
