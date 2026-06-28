@@ -60,12 +60,12 @@ def launch_sidecar(host, port, announce, inbound, forwards):
     return False
 
 
-def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False):
+def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
@@ -98,6 +98,7 @@ def main():
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--validate", action="store_true"); ap.add_argument("--receipts", action="store_true")
     ap.add_argument("--serve", action="store_true", help="deploy mode: after warm, start the OpenAI /v1 gateway on the head (persistent) instead of a one-shot coord job")
+    ap.add_argument("--batch", type=int, default=1, help="continuous batching: stages allocate [B,...] KV (M25_BATCH); warm the ring with --serve then drive coordinate_pipe_batch")
     a = ap.parse_args()
     nodes = []
     for spec in a.order:
@@ -132,7 +133,7 @@ def main():
 
     print("[pipe] stages tail-first ...", flush=True)
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts)
+        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch)
     for k in range(n - 1, -1, -1):
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
