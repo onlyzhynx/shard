@@ -47,6 +47,19 @@ _SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION,
 # with causal_lower_right, so the static path is BIT-IDENTICAL to cat (proven: research/m25_statickv_test.py).
 M25_STATIC_KV = os.environ.get("M25_STATIC_KV", "0") != "0"
 M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
+# Continuous batching (opt-in M25_BATCH=B): run B concurrent requests through one ring traversal so the WAN
+# round-trip amortizes across all B (aggregate-throughput lever). Each Layer gets a [B,NKV,MAXLEN,HD] KV;
+# the fixed-shape DECODE block batches (per-stream scatter + per-stream additive causal mask — batchverify
+# pattern, proven bit-exact), the MoE runs PER STREAM (NVFP4 MoE is token-count non-invariant), prefill
+# writes one row. Each stream's output is byte-identical to solo. Default 1 (single-stream path untouched).
+M25_BATCH = int(os.environ.get("M25_BATCH", "1"))
+
+
+def _bucket(need):                                  # smallest decode bucket >= need, clamped to MAXLEN
+    for b in (2048, 4096, 8192, 16384, 32768, 65536, 131072):
+        if b >= need:
+            return min(b, M25_KV_MAXLEN)
+    return M25_KV_MAXLEN
 # CUDA-graph decode (opt-in M25_CUDA_GRAPH): capture run_block at a FIXED (s=K+1, bucket) shape so a verify
 # block replays as ONE graph — removes per-kernel launch overhead. Needs M25_STATIC_KV + M25_SDPA. Varying
 # start_pos is carried into the graph by _GR's STATIC buffers: RoPE slice (cos/sin), index_copy_ positions
@@ -160,6 +173,10 @@ class Layer:
         if M25_STATIC_KV:                                          # fixed-address buffers (graph/concurrency prereq)
             self.kc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
             self.vc = torch.zeros(1, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
+        self.bkc = self.bvc = None
+        if M25_BATCH > 1:                                          # [B,NKV,MAXLEN,HD] per-stream KV for continuous batching
+            self.bkc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
+            self.bvc = torch.zeros(M25_BATCH, NKV, M25_KV_MAXLEN, HD, dtype=torch.bfloat16, device=dev)
 
     def reset(self):
         if M25_STATIC_KV:
@@ -245,6 +262,70 @@ class Layer:
         x = x + self.mlp(self._rms(x, self.post_ln))
         return x
 
+    # ---- continuous batching (M25_BATCH>1): prefill writes one row; decode batches all rows ----
+    def attn_prefill_b(self, x, b, start, cos, sin):
+        """PER-STREAM prefill into batch-row b (x: [1, L, H]); SDPA-flash over :total (same as single-stream)."""
+        _, s, _ = x.shape
+        lin = torch.nn.functional.linear
+        q = self._rms(lin(x, self.q_proj), self.q_norm).view(1, s, NH, HD).transpose(1, 2)
+        k = self._rms(lin(x, self.k_proj), self.k_norm).view(1, s, NKV, HD).transpose(1, 2)
+        v = lin(x, self.v_proj).view(1, s, NKV, HD).transpose(1, 2)
+        rd = cos.shape[-1]
+        cu = cos[start:start + s].unsqueeze(0).unsqueeze(0); su = sin[start:start + s].unsqueeze(0).unsqueeze(0)
+        def ap(t):
+            tr, tp = t[..., :rd], t[..., rd:]
+            return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
+        q, k = ap(q), ap(k)
+        total = start + s
+        cp = torch.arange(start, total, device=dev)
+        self.bkc[b:b + 1].index_copy_(2, cp, k); self.bvc[b:b + 1].index_copy_(2, cp, v)   # b:b+1 is a view → writes row b
+        with sdpa_kernel(_SDPA_BACKENDS):
+            o = torch.nn.functional.scaled_dot_product_attention(
+                q, self.bkc[b:b + 1, :, :total], self.bvc[b:b + 1, :, :total],
+                attn_mask=causal_lower_right(s, total), scale=SCALING, enable_gqa=True)
+        return lin(o.transpose(1, 2).reshape(1, s, NH * HD), self.o_proj)
+
+    def attn_decode_b(self, x, starts, cos, sin):
+        """BATCHED decode (x: [B, s, H], starts: [B] long). Per-stream RoPE/scatter/mask (batchverify
+        pattern, proven bit-exact vs solo). Manual matmul over a shared bucket; per-stream mask isolates
+        each stream + zeros its unwritten tail."""
+        B, s, _ = x.shape
+        lin = torch.nn.functional.linear
+        q = self._rms(lin(x, self.q_proj), self.q_norm).view(B, s, NH, HD).transpose(1, 2)
+        k = self._rms(lin(x, self.k_proj), self.k_norm).view(B, s, NKV, HD).transpose(1, 2)
+        v = lin(x, self.v_proj).view(B, s, NKV, HD).transpose(1, 2)
+        rd = cos.shape[-1]
+        cp = starts.view(B, 1) + torch.arange(s, device=dev).view(1, s)           # [B,s] abs positions
+        cu = cos[cp].unsqueeze(1); su = sin[cp].unsqueeze(1)                       # [B,1,s,rd] per-stream RoPE
+        def ap(t):
+            tr, tp = t[..., :rd], t[..., rd:]
+            return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
+        q, k = ap(q), ap(k)
+        idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
+        self.bkc[:B].scatter_(2, idx, k); self.bvc[:B].scatter_(2, idx, v)        # per-stream scatter into rows [0,B)
+        alen = _bucket(int(starts.max().item()) + s)
+        kk = self.bkc[:B, :, :alen].repeat_interleave(GRP, 1); vv = self.bvc[:B, :, :alen].repeat_interleave(GRP, 1)
+        cols = torch.arange(alen, device=dev).view(1, 1, alen)
+        amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]  # [B,1,s,alen]
+        a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
+        o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)
+        return lin(o.transpose(1, 2).reshape(B, s, NH * HD), self.o_proj)
+
+    def mlp_b(self, x):                                                            # per-stream MoE (token-count invariance)
+        return torch.cat([self.mlp(x[b:b + 1]) for b in range(x.shape[0])], 0)
+
+    def forward_prefill_b(self, x, b, start, pe):
+        cos, sin = pe
+        x = x + self.attn_prefill_b(self._rms(x, self.in_ln), b, start, cos, sin)
+        x = x + self.mlp(self._rms(x, self.post_ln))                              # 1 stream, L tokens == solo
+        return x
+
+    def forward_decode_b(self, x, starts, pe):
+        cos, sin = pe
+        x = x + self.attn_decode_b(self._rms(x, self.in_ln), starts, cos, sin)
+        x = x + self.mlp_b(self._rms(x, self.post_ln))                            # per-stream MoE
+        return x
+
 
 _PE = None
 # Rotary table length. MUST cover the full context: attn() indexes cos[start_pos:start_pos+s],
@@ -270,6 +351,24 @@ def run_block(layers, start_pos, h, vcfg):
     with torch.no_grad(), set_forward_context(None, vcfg):
         for L in layers:
             h = L.forward(h, start_pos, pe)
+    return h
+
+
+def run_block_prefill_b(layers, b, start, h, vcfg):     # continuous batching: prefill stream into row b
+    from vllm.forward_context import set_forward_context
+    pe = get_pe()
+    with torch.no_grad(), set_forward_context(None, vcfg):
+        for L in layers:
+            h = L.forward_prefill_b(h, b, start, pe)
+    return h
+
+
+def run_block_decode_b(layers, starts, h, vcfg):        # continuous batching: batched decode, all rows
+    from vllm.forward_context import set_forward_context
+    pe = get_pe()
+    with torch.no_grad(), set_forward_context(None, vcfg):
+        for L in layers:
+            h = L.forward_decode_b(h, starts, pe)
     return h
 
 
