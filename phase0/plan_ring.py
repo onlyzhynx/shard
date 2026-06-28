@@ -30,8 +30,17 @@ from scheduler_svc import plan                                            # loca
 # logic (parse_vram_gb, build_nodes, plan_fleet-with-stub) stays importable + testable
 # offline with no PSK and no vast creds.
 
-# gpt-oss-120B: 78 transformer layers (matches launch_swarm.NLAYERS).
-DEFAULT_TOTAL_LAYERS = 78
+# S1: layer counts are MODEL-SPECIFIC, not a global default. The old comment said
+# "gpt-oss-120B: 78 transformer layers" which was a GLM holdover (GLM-5.2 is 78).
+# gpt-oss-120B has 36 layers (proven: gateway.py "36 layers", ROADMAP "MXFP4, 36
+# layers", PROOF.md "3 stages, 12 layers each"). The CLI requires --total-layers
+# explicitly so no model is ever silently mis-counted.
+MODEL_LAYERS = {
+    "gpt-oss-120b": 36,
+    "glm-5.2": 78,
+    "minimax-m2.5": 62,
+    "deepseek-v3": 61,
+}
 # NVFP4 120B: ~ model bytes per layer. Conservative so the fit never over-commits a box.
 # (tune per quant; the scheduler subtracts headroom+boundary on top of this.)
 DEFAULT_GB_PER_LAYER = 1.05
@@ -106,11 +115,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ids", required=True, help="comma instance ids of the running boxes")
     ap.add_argument("--model", default="/root/models/gpt-oss-120b")
-    ap.add_argument("--total-layers", type=int, default=DEFAULT_TOTAL_LAYERS)
+    ap.add_argument("--total-layers", type=int, default=None,
+                   help="model layer count (required if model not in MODEL_LAYERS; S1: was default 78 which was GLM-specific)")
     ap.add_argument("--gb-per-layer", type=float, default=DEFAULT_GB_PER_LAYER)
     ap.add_argument("--kv-gb-per-layer", type=float, default=DEFAULT_KV_GB_PER_LAYER)
     ap.add_argument("--coordinator", default="", help="pin coordinator instance id (else lowest-mean-rtt)")
     a = ap.parse_args()
+
+    # S1: resolve layer count from MODEL_LAYERS or require --total-layers explicitly.
+    model_key = a.model.lower().split("/")[-1]
+    total_layers = a.total_layers
+    if total_layers is None:
+        total_layers = MODEL_LAYERS.get(model_key)
+    if total_layers is None:
+        print(f"error: cannot determine layer count for model '{a.model}'. "
+              f"Pass --total-layers explicitly. Known: {list(MODEL_LAYERS.keys())}", flush=True)
+        sys.exit(1)
 
     ids = [int(x) for x in a.ids.split(",") if x.strip()]
     from launch_oss import instances                                       # lazy: fleet-only
@@ -126,14 +146,14 @@ def main():
     print("[rtt] probing mesh ...", flush=True)
     rtt_matrix = launch_swarm.mesh_rtt(insts)
 
-    p = plan_fleet(insts, a.model, a.total_layers, a.gb_per_layer, a.kv_gb_per_layer,
+    p = plan_fleet(insts, a.model, total_layers, a.gb_per_layer, a.kv_gb_per_layer,
                    a.coordinator or None, rtt_matrix=rtt_matrix)
 
     ring = p["ring_order"]
     layers = ",".join(str(s["n_layers"]) for s in p["stages"])
     print(f"[plan] coordinator={p['coordinator']}", flush=True)
     print(f"[plan] ring: {' -> '.join(ring)}", flush=True)
-    print(f"[plan] layers: {layers}  (covers [0:{a.total_layers}])", flush=True)
+    print(f"[plan] layers: {layers}  (covers [0:{total_layers}])", flush=True)
     for s in p["stages"]:
         print(f"         stage{s['stage']} {s['node_id']}  [{s['lo']}:{s['hi']}]  {s['n_layers']}L", flush=True)
     print("\nRUN:", flush=True)
