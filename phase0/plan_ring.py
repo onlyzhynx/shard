@@ -24,27 +24,38 @@ Boundary law: pure control-plane. vram + rtt + layers in, ring spec out. No acco
 import argparse, sys, os, concurrent.futures as cf
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))            # phase0/
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root (shard pkg)
 from scheduler_svc import plan                                            # local import, no HTTP
+from shard import registry as reg                                        # M1: single signed registry
 # NB: launch_oss / launch_swarm read ~/.shard_psk at import and pull vastai — they're the
 # FLEET side. Import them lazily (inside the ssh-touching functions) so the pure planning
 # logic (parse_vram_gb, build_nodes, plan_fleet-with-stub) stays importable + testable
 # offline with no PSK and no vast creds.
 
-# S1: layer counts are MODEL-SPECIFIC, not a global default. The old comment said
-# "gpt-oss-120B: 78 transformer layers" which was a GLM holdover (GLM-5.2 is 78).
-# gpt-oss-120B has 36 layers (proven: gateway.py "36 layers", ROADMAP "MXFP4, 36
-# layers", PROOF.md "3 stages, 12 layers each"). The CLI requires --total-layers
-# explicitly so no model is ever silently mis-counted.
-MODEL_LAYERS = {
-    "gpt-oss-120b": 36,
-    "glm-5.2": 78,
-    "minimax-m2.5": 62,
-    "deepseek-v3": 61,
-}
-# NVFP4 120B: ~ model bytes per layer. Conservative so the fit never over-commits a box.
-# (tune per quant; the scheduler subtracts headroom+boundary on top of this.)
+# M1: layer counts (and bytes/layer, quant, engine path) now come from ONE signed registry
+# (shard/registry.py -> registry/models.json), read by BOTH repos. The old MODEL_LAYERS dict
+# lived here AND in c0mpute types.ts AND in getLayerCountForModel — three copies that drifted
+# (gpt-oss 120-vs-36). Deleted. --total-layers stays an explicit override only.
+# Resolution order: --total-layers > registry by model id > registry by enginePath basename.
 DEFAULT_GB_PER_LAYER = 1.05
 DEFAULT_KV_GB_PER_LAYER = 0.04
+
+
+def _registry_lookup(model_arg: str):
+    """Find a registry row for the --model arg, matching either its `id` or the basename of
+    its `enginePath` (the CLI takes a path like /root/models/gpt-oss-120b OR an id). Returns
+    (layerCount, gbPerLayer, kvGbPerLayer) or (None, None, None) if not found/registry absent.
+    Fail-soft: a missing/invalid registry just means the caller must pass --total-layers."""
+    try:
+        registry = reg.load_registry(expected_pubkey=os.environ.get("SHARD_MODELS_PUBKEY") or None)
+    except reg.RegistryError:
+        return None, None, None
+    base = model_arg.lower().rstrip("/").split("/")[-1]
+    for m in registry.get("models", []):
+        eng_base = str(m.get("enginePath", "")).lower().rstrip("/").split("/")[-1]
+        if model_arg == m["id"] or base == m["id"] or base == eng_base:
+            return m["layerCount"], m.get("gbPerLayer"), m.get("kvGbPerLayer")
+    return None, None, None
 
 
 def parse_vram_gb(nvidia_smi_out: str) -> float:
@@ -116,21 +127,27 @@ def main():
     ap.add_argument("--ids", required=True, help="comma instance ids of the running boxes")
     ap.add_argument("--model", default="/root/models/gpt-oss-120b")
     ap.add_argument("--total-layers", type=int, default=None,
-                   help="model layer count (required if model not in MODEL_LAYERS; S1: was default 78 which was GLM-specific)")
-    ap.add_argument("--gb-per-layer", type=float, default=DEFAULT_GB_PER_LAYER)
-    ap.add_argument("--kv-gb-per-layer", type=float, default=DEFAULT_KV_GB_PER_LAYER)
+                   help="model layer count override (default: resolved from the signed registry)")
+    ap.add_argument("--gb-per-layer", type=float, default=None,
+                   help="model bytes/layer override (default: registry, else %.2f)" % DEFAULT_GB_PER_LAYER)
+    ap.add_argument("--kv-gb-per-layer", type=float, default=None,
+                   help="KV bytes/layer override (default: registry, else %.2f)" % DEFAULT_KV_GB_PER_LAYER)
     ap.add_argument("--coordinator", default="", help="pin coordinator instance id (else lowest-mean-rtt)")
     a = ap.parse_args()
 
-    # S1: resolve layer count from MODEL_LAYERS or require --total-layers explicitly.
-    model_key = a.model.lower().split("/")[-1]
-    total_layers = a.total_layers
-    if total_layers is None:
-        total_layers = MODEL_LAYERS.get(model_key)
+    # M1: resolve layer count + fit bytes from the ONE signed registry, with explicit CLI
+    # overrides winning. No more local MODEL_LAYERS copy to drift against c0mpute.
+    reg_layers, reg_gb, reg_kv = _registry_lookup(a.model)
+    total_layers = a.total_layers if a.total_layers is not None else reg_layers
     if total_layers is None:
         print(f"error: cannot determine layer count for model '{a.model}'. "
-              f"Pass --total-layers explicitly. Known: {list(MODEL_LAYERS.keys())}", flush=True)
+              f"Add it to the signed registry (registry/models.json) or pass --total-layers.",
+              flush=True)
         sys.exit(1)
+    gb_per_layer = (a.gb_per_layer if a.gb_per_layer is not None
+                    else (reg_gb if reg_gb is not None else DEFAULT_GB_PER_LAYER))
+    kv_gb_per_layer = (a.kv_gb_per_layer if a.kv_gb_per_layer is not None
+                       else (reg_kv if reg_kv is not None else DEFAULT_KV_GB_PER_LAYER))
 
     ids = [int(x) for x in a.ids.split(",") if x.strip()]
     from launch_oss import instances                                       # lazy: fleet-only
@@ -146,7 +163,7 @@ def main():
     print("[rtt] probing mesh ...", flush=True)
     rtt_matrix = launch_swarm.mesh_rtt(insts)
 
-    p = plan_fleet(insts, a.model, total_layers, a.gb_per_layer, a.kv_gb_per_layer,
+    p = plan_fleet(insts, a.model, total_layers, gb_per_layer, kv_gb_per_layer,
                    a.coordinator or None, rtt_matrix=rtt_matrix)
 
     ring = p["ring_order"]
