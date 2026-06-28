@@ -21,6 +21,10 @@ import json
 import m25_stage as S
 from m25_tools import render_ids, parse_completion          # tool-calling: chat-template render + output parse
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError   # libp2p codec (SHARD_TRANSPORT=libp2p)
+try:                                                    # opt-in confidence-scheduled depth (M25_CONF_SCHED=1)
+    from confidence import ConfidenceScheduler
+except Exception:
+    ConfidenceScheduler = None
 
 dev = "cuda"
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -97,9 +101,12 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
         inflight = []; discard = 0; send_pos = pos; dprefix = gen_ids + [cur]
         valid = accepted = wasted = 0; t0 = time.time(); done = False
+        conf = (ConfidenceScheduler(1, depth, lo=0.3, hi=0.7)               # opt-in DSpark depth throttle (M25_CONF_SCHED)
+                if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
         d_request(dprefix, K)
         while not done:
-            while len(inflight) < depth and not done:
+            cur_depth = conf.value() if conf else depth                     # high accept -> full depth (throughput); low -> throttle to 1
+            while len(inflight) < cur_depth and not done:
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
@@ -112,6 +119,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 if ds[j] == r[j]: n += 1
                 else: break
             valid += 1; accepted += n
+            if conf: conf.observe(n, K)                                     # acceptance EMA (free, from the verify result)
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]; committed = ds
             else:
@@ -132,7 +140,32 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
             "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
-            "prompt_tokens": len(prompt_ids), "receipts": receipts, "receipts_ok": receipts_ok}
+            "prompt_tokens": len(prompt_ids), "receipts": receipts, "receipts_ok": receipts_ok,
+            "final_confidence": conf.confidence() if conf else None}
+
+
+def _sdpa_backend_probe(stage):
+    """Fail loud at warm-up (not mid-prefill OOM) if no FUSED SDPA backend serves the prefill shape on this
+    GPU. A fused backend (flash/cudnn/efficient) does online softmax = O(s) memory; the MATH fallback
+    materializes the [1,NH,s,total] score matrix = the very OOM the SDPA fix removes. Reports which engage."""
+    avail = []
+    qd = torch.randn(1, S.NH, 64, S.HD, dtype=torch.bfloat16, device=dev)
+    kd = torch.randn(1, S.NKV, 256, S.HD, dtype=torch.bfloat16, device=dev)
+    mask = S.causal_lower_right(64, 256)
+    for name, be in [("flash", S.SDPBackend.FLASH_ATTENTION), ("cudnn", S.SDPBackend.CUDNN_ATTENTION),
+                     ("efficient", S.SDPBackend.EFFICIENT_ATTENTION)]:
+        try:
+            with S.sdpa_kernel([be]):
+                torch.nn.functional.scaled_dot_product_attention(qd, kd, kd, attn_mask=mask,
+                                                                 scale=S.SCALING, enable_gqa=True)
+            avail.append(name)
+        except Exception:
+            pass
+    if avail:
+        print(f"[s{stage}] SDPA fused backends available on sm_120: {avail}", flush=True)
+    else:
+        print(f"[s{stage}] WARN SDPA: NO fused backend serves the prefill shape — falls back to MATH "
+              f"(materializes scores; long-ctx will OOM). Lower prefill_chunk or set M25_SDPA=0.", flush=True)
 
 
 def _load(stage, nstages, lo, hi):
@@ -150,6 +183,8 @@ def _load(stage, nstages, lo, hi):
         for L in layers:
             L.reset()
     torch.cuda.synchronize()
+    if S.M25_SDPA:
+        _sdpa_backend_probe(stage)
     return parts
 
 
@@ -408,7 +443,7 @@ if __name__ == "__main__":
     pc.add_argument("--ngram-n", type=int, default=3); pc.add_argument("--timeout", type=int, default=600)
     pc.add_argument("--sweep", default=None, help="comma K list, e.g. 4,6,8,12,16 (drafter margin is safe to K<=16)")
     pc.add_argument("--sweep-depth", default=None, help="comma depth list, e.g. 2,4,8 (default: --depth)")
-    pc.add_argument("--prefill-chunk", type=int, default=512, help="prefill tokens per ring traversal; bounds the O(s^2) attn matrix so a long prompt doesn't OOM a memory-tight stage")
+    pc.add_argument("--prefill-chunk", type=int, default=512, help="prefill tokens per ring traversal; under M25_SDPA (default) attn is O(chunk) not O(chunk*ctx), so this is now a TTFT/bandwidth knob, not the OOM guard")
     pc.add_argument("--validate", action="store_true", help="full usability pass: tools + multi-turn + long-ctx (needle) + receipts, one warm ring")
     a = ap.parse_args()
 

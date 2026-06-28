@@ -56,6 +56,13 @@ Always create boxes with `--env '-p 29600:29600'` (inter-stage transport unreach
   prints one tok/s + g + accept% + h/trav table and the winning (K,depth). Baseline 15.79 @ K6/d4. Keep
   K≤16 (n-gram drafter's `margin=256` covers depth≤8,K≤16; bigger K needs a wider margin). The sweep
   driver (`_sweep_summary`) is unit-proven off-box: `research/m25_sweep_test.py` (8/8).
+- **Confidence-scheduled depth — A/B it (opt-in `M25_CONF_SCHED=1` on the COORD, default OFF).** Adapts the
+  in-flight verify depth from the running acceptance EMA: high accept → full `--depth` (throughput), a bad-draft
+  streak → throttle toward 1 (fewer stale WAN chunks discarded). K stays fixed so it's CUDA-graph-safe and
+  byte-lossless — proven so off-box (`research/m25_confsched_test.py`: output identical ON vs OFF == greedy
+  truth, high + zero accept). On a high-accept copy/retrieval task it's inert (sits at full depth) = no
+  regression to the warm baseline; the win shows on variable-acceptance (novel/chat) gen. Run the sweep once
+  with the flag and once without on a chat-style prompt to measure. `confidence.py` is in the push set.
 - **Long context (≥30k)**: set `M25_MAX_POS` ≥ the prompt+gen length on every stage (default 131072).
   The rotary table is now sized from it — a table shorter than the context silently returns garbage RoPE
   (the old hard-coded 8192 cap broke any >8k run, incl. this very test). Use this for the pipelined-prefill

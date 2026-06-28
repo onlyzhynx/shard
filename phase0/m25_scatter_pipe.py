@@ -27,7 +27,7 @@ def sh(host, port, cmd, timeout=120):
 
 def push_code(host, port):
     for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/ngram_draft.py",
-              "phase0/node_kv.py", "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
+              "phase0/node_kv.py", "phase0/confidence.py", "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
         subprocess.run(["scp", *SSHO, "-P", str(port), f"{REPO}/{f}", f"root@{host}:{dst}"], capture_output=True, text=True)
 
