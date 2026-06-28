@@ -52,16 +52,17 @@ M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
 # start_pos is carried into the graph by _GR's STATIC buffers: RoPE slice (cos/sin), index_copy_ positions
 # (cp), and a bucketed additive causal mask. Prefill stays eager; default OFF.
 #
-# ⚠️ EXPERIMENTAL — DO NOT ENABLE FOR DEPLOY YET (on-box 2026-06-28, single 5090):
-#   * The GraphRunner capture/replay is CORRECT — it bit-exactly reproduces its eager computation (graph vs
-#     eager-additive diff = 0.0). The fixed-position probe with causal_lower_right hit 3.40x bit-exact.
-#   * BUT this path uses a dense ADDITIVE mask (causal_lower_right mis-aligns under a bucketed read), which
-#     FALLS OFF FLASH onto a slower backend → 0.74x (SLOWER), and its bf16 rounding differs from the eager
-#     causal_lower_right default, amplifying through MoE routing (graph vs eager-causal diff ~11). So toggling
-#     this changes output AND is slower — a dead end as-is.
-#   * FIX (next iteration): a FLASH-COMPATIBLE fixed-shape causal — FLEX-ATTENTION (create_block_mask, like
-#     gpt-oss fastverify) compiles the causal-bucket mask with no dense tensor and stays on the fast path.
-#     The GraphRunner scaffolding below is reusable; only attn's masked read needs swapping to flex.
+# ⚠️ EXPERIMENTAL / default-OFF — NOT WORTH IT ON CURRENT TORCH (measured 2026-06-28):
+#   * The GraphRunner capture/replay is CORRECT and FAITHFUL — graph vs eager-manual diff = 0.0. The masked
+#     read uses a MANUAL matmul + static additive mask (a microbench showed SDPA+dense-mask falls off flash
+#     8-14x; manual is the fastest GRAPHABLE bucketed variant, and attention is a tiny slice of the block).
+#   * BUT the whole lever only pays when kernel-LAUNCH overhead is high. On torch 2.10+cu128 a fixed-position
+#     probe hit 3.40x; on torch 2.11+cu130 the eager block is already ~3ms (launch overhead is gone) so the
+#     graph nets only ~1.05x — and the masked-read overhead (manual attn + per-call mask build) eats it.
+#     `pip install vllm` now pulls 2.11+, so deployments see ~1.05x → not worth the complexity / the
+#     non-bit-identical-to-eager-flash decode. Left here (opt-in, isolated) for high-launch-overhead torch.
+#   * The real throughput bottleneck is NOT GPU launches on current torch — it's WAN/handoff/drafting. See
+#     the profile + drafting tasks. receipts: m25-cudagraph-production / m25-attn-microbench-20260628.
 M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
 if M25_CUDA_GRAPH:
     M25_STATIC_KV = True
@@ -209,7 +210,16 @@ class Layer:
                 self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
             total = self.kc.shape[2]
             kcur, vcur, amask = self.kc, self.vc, causal_lower_right(s, total)
-        if M25_SDPA:
+        if gr is not None:
+            # GRAPHED decode: MANUAL matmul + the static additive mask (amask=gr.mask). Microbench (sm_120):
+            # SDPA-with-dense-mask falls off flash (8-14x slower); manual is the fastest GRAPHABLE bucketed
+            # variant (~2.4x flash) — and since attention is a tiny slice of the block (MoE/projections
+            # dominate ~1.9ms/layer), the block graph still nets the launch-overhead win. Manual is also
+            # bit-identical eager↔graph (same op) so toggling the graph is safe.
+            kk = kcur.repeat_interleave(GRP, dim=1); vv = vcur.repeat_interleave(GRP, dim=1)
+            a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
+            o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)
+        elif M25_SDPA:
             with sdpa_kernel(_SDPA_BACKENDS):
                 o = torch.nn.functional.scaled_dot_product_attention(
                     q, kcur, vcur, attn_mask=amask, scale=SCALING, enable_gqa=True)

@@ -1,0 +1,20 @@
+{
+ "test": "Attention-variant microbench (pure torch, 1x RTX 5090 sm_120) + GraphRunner re-validation, to pick the CUDA-graph masked-read approach by measurement. Verdict: CUDA-graph is NOT worth it on current torch.",
+ "date": "2026-06-28",
+ "decode_shape": "s=K+1=9, GQA 48q/8kv, HD=128; buckets 2048 (short) + 16384 (long)",
+ "attention_op_graphed_ms": {
+  "comment": "graphed = launch overhead removed = the in-graph compute cost. flash :total is the floor.",
+  "short_2048": {"flash_causal_lower_right_:total": 0.029, "sdpa_additive_:alen": 0.240, "manual_matmul_:alen": 0.070, "flex_:alen": 0.109},
+  "long_16384": {"flash_causal_lower_right_:total": 0.141, "sdpa_additive_:alen": 1.956, "manual_matmul_:alen": 0.648, "flex_:alen": 0.777},
+  "takeaway": "the bucketed read (:alen + mask) can't match flash :total; manual matmul is the fastest GRAPHABLE bucketed variant (beats SDPA-additive 3-4x AND flex here). But attention is a tiny slice of the block, so the variant barely matters for the block graph."
+ },
+ "graphrunner_with_manual": {
+  "faithful": "graph vs eager-manual max|diff| = 0.0 (capture/replay correct)",
+  "vs_eager_causal": "~4-10 (manual vs flash bf16 drift, amplified by MoE — expected, accepted as a self-consistent decode kernel)",
+  "speedup_torch_2.11_cu130": "eager-flash block 3.13ms -> graph(manual) 2.93ms = 1.07x (m25_char); 3.01->2.95 = 1.02x (graphrun, 4 layers)"
+ },
+ "root_cause": "CUDA-graph removes per-kernel LAUNCH overhead. torch 2.10+cu128 had high launch overhead -> the fixed-position probe hit 3.40x. torch 2.11+cu130 already eliminated it (eager block ~3ms) -> graph nets only ~1.05x, and the masked-read overhead eats that. `pip install vllm` now pulls torch 2.11+, so real deployments see ~1.05x.",
+ "decision": "ABANDON CUDA-graph as the throughput lever (not worth the complexity + non-bit-identical decode for ~5%). M25_CUDA_GRAPH stays opt-in/default-OFF, documented for high-launch-overhead torch only. The GraphRunner machinery is proven-faithful and left isolated.",
+ "redirect": "The throughput bottleneck on current torch is NOT GPU launches — GPU is ~0.75ms/layer (~10ms/13-layer stage). Next: (1) PROFILE a warm ring to split GPU vs WAN-RTT vs handoff vs draft per traversal; (2) attack the real lever — most likely DRAFTING (raise g = tokens/traversal, the WAN-amortization lever) since the WAN round dominates, not the GPU.",
+ "files": ["research/m25_attnbench.py", "phase0/m25_stage.py"]
+}
