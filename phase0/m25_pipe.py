@@ -176,7 +176,7 @@ def _sdpa_backend_probe(stage):
 
 
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
-                          tools=None, prefill_chunk=4096, max_ctx=0):
+                          depth=4, tools=None, prefill_chunk=4096, max_ctx=0):
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
     round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). SYNCHRONOUS
     (one batched verify per round — no per-stream depth pipelining; the batching itself provides the
@@ -209,31 +209,48 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         pos[b] = len(gen); out[b] = [cur[b]]
         if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
         drafters[b].request(prompts[b] + [cur[b]], K)
-    rounds = 0
-    while not all(done):
-        rounds += 1
-        tids = []; dss = []
-        for b in range(B):                              # each ACTIVE stream drafts K; done streams send a pad row (ignored)
-            if done[b]:
-                tids.append([cur[b]] * (K + 1)); dss.append(None); continue
-            ds = drafters[b].fetch(); dss.append(ds); tids.append([cur[b]] + ds)
-        send_msg(pipe_sock, {"op": "verify_batch", "token_ids_b": tids, "start_b": list(pos)})
+    # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
+    # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
+    # Each round speculatively advances ALL B streams; on a stream's divergence we drop that stream's stale
+    # in-flight chunks (per-row discard) and re-draft. Each stream stays data-isolated (output depends on B, not
+    # on batch-mates) and byte-faithful to solo up to the batched-matmul tiling. Mirrors coordinate_pipe per row.
+    rounds = 0; wasted = 0
+    dprefix = [prompts[b] + [cur[b]] for b in range(B)]     # speculative continuation per stream (prefill already requested)
+    spos = list(pos)                                        # send position per stream (advances K per drafted chunk)
+    discard = [0] * B                                       # stale-chunk skip counter per stream after a divergence
+    inflight = []                                           # FIFO of rounds; each = [(spos_b, ds_b) | None] over b
+    while not all(done) or inflight:
+        while len(inflight) < depth and not all(done):      # fill the in-flight window (speculative per stream)
+            tids = []; row = []; sb = []
+            for b in range(B):
+                if done[b]:
+                    tids.append([cur[b]] * (K + 1)); row.append(None); sb.append(pos[b]); continue
+                ds = drafters[b].fetch()
+                tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
+                dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
+            send_msg(pipe_sock, {"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
+            inflight.append(row)
+        if not inflight:
+            break
         tr = time.time(); rb = recv_msg(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
+        row = inflight.pop(0); rounds += 1
         for b in range(B):
-            if done[b]:
+            if row[b] is None or done[b]:
                 continue
-            ds = dss[b]; r = rb[b]; n = 0
+            if discard[b] > 0:                              # stale chunk from before this stream's last divergence
+                discard[b] -= 1; wasted += 1; continue
+            _, ds = row[b]; r = rb[b]; n = 0
             for j in range(K):
                 if ds[j] == r[j]: n += 1
                 else: break
             if n == K:
                 out[b].extend(ds); pos[b] += K; cur[b] = ds[-1]; committed = ds
-            else:
+            else:                                           # divergence: commit prefix, drop this stream's stale in-flight, re-draft
                 committed = ds[:n] + [r[n]]; out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
+                discard[b] = sum(1 for rr in inflight if rr[b] is not None)
+                drafters[b].fetch(); dprefix[b] = prompts[b] + out[b]; spos[b] = pos[b]; drafters[b].request(dprefix[b], K)
             if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
                 done[b] = True
-            else:
-                drafters[b].request(prompts[b] + out[b], K)
     dt = time.time() - t0
     res = []
     for b in range(B):                                  # trim at first eos, per stream
@@ -242,7 +259,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             if ee in o: o = o[:o.index(ee)]; break
         res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
                     "text": tok.decode(o, skip_special_tokens=True)})
-    return {"streams": res, "B": B, "rounds": rounds, "dt": dt,
+    return {"streams": res, "B": B, "rounds": rounds, "depth": depth, "wasted": wasted, "dt": dt,
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
