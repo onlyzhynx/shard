@@ -4,8 +4,9 @@
 debt. This is the internal engineering contract; [NETWORK.md](NETWORK.md) is the public
 narrative. (Supersedes the transport/scheduler/integration sections of the older
 [ARCHITECTURE.md](ARCHITECTURE.md), which predates the proven stack — SGLang→transformers,
-aioquic→libp2p, shared PSK→per-node keys.) Build target: **gpt-oss-120B on 4× RTX 4090**,
-the most practical swarm a stranger can join.*
+aioquic→libp2p, shared PSK→per-node keys.) Betanet target: **MiniMax-M2.5 on scattered consumer
+5090s** — the proof-of-concept for sharded inference; the engine runs any model behind one
+`ModelRuntime` interface ([MODEL_RUNTIME.md](MODEL_RUNTIME.md)), so the catalog widens from there.*
 
 ---
 

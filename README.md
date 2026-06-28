@@ -1,11 +1,21 @@
 # Shard
 
-Pipeline-parallel LLM inference across GPUs on separate machines. A model too
-large for any single card is split into contiguous blocks of layers — one shard
-per GPU — and a request is served by streaming activations through the shards in
-order. No datacenter, no single host, and no node ever holds the whole model.
+**The engine for a permissionless compute network** — *BitTorrent, but you share
+VRAM and compute instead of disk.* Anyone plugs in a GPU of any kind; the network
+pools them into swarms that run models far larger than any single card holds. The
+long arc is a worldwide compute fabric: many models, ever bigger, and eventually
+training and general compute. Shard is the protocol that connects it.
 
-Shard is the inference engine for [c0mpute](https://c0mpute.ai).
+**Proven today: sharded inference.** A model too large for any single card is split
+into contiguous blocks of layers — one shard per GPU — and a request is served by
+streaming activations through the shards in order, over the open internet. No
+datacenter, no single host, and no node ever holds the whole model.
+
+Shard is the serving engine for [c0mpute](https://c0mpute.ai). The engine is built to
+run *any* model behind one interface ([docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md));
+**MiniMax-M2.5 is the current betanet target — the proof-of-concept for sharded
+inference** — and the GLM-5.2 and gpt-oss-120B runs below proved the engine scales
+from consumer cards to frontier size.
 
 ## GLM-5.2 (744B) across seven scattered prosumer GPUs, over the open internet
 
@@ -117,11 +127,14 @@ Shard is c0mpute infrastructure, held to its three guarantees:
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is the number-one open problem and is
   treated as one.
 
-## gpt-oss-120B at ~40 tok/s over WAN — the permissionless build target
+## gpt-oss-120B at ~40 tok/s over WAN — proving the engine on consumer cards
 
 120B (MXFP4, 36 layers) across **3 scattered RTX 4090s in different US states** + a
-coordinator, **~40 tok/s (peak ~42), greedy, exact**. This is the rig the permissionless
-work (Phase 3+) is built on — plain 24GB consumer cards, the hardware a real volunteer runs.
+coordinator, **~40 tok/s (peak ~42), greedy, exact**. This proved the permissionless
+stack (Phase 3+) on plain 24GB consumer cards — the hardware a real volunteer runs. The
+current **betanet base model is MiniMax-M2.5** (229B-A10B MoE), warm-validated over libp2p
+with signed receipts (tool-calling, multi-turn, long context); gpt-oss-120B and GLM-5.2
+remain the consumer-card and frontier-size scaling proofs.
 This run's verifiable receipt (distinct GPU UUIDs / IPs / states, WAN edge RTTs, output
 hash, sync-vs-pipelined token match): [`docs/receipts/gpt-oss-120b-wan-20260619.json`](docs/receipts/gpt-oss-120b-wan-20260619.json).
 
@@ -144,13 +157,15 @@ gpt-oss-120B is the faster, consumer-card build target the network is bootstrapp
 
 ## Repository layout
 
-    phase0/   transport + deploy: wire.py (sealed framing), mesh.py (edge RTTs),
-              proof_receipt.py (run-receipt build/verify), launch + bench tooling
-    research/ the swarm drivers — glm_swarm_nvfp4_kv.py (NVFP4 KV-cached stages),
-              glm_swarm_nvfp4_pipe.py (pipelined spec-decode), glm_swarm_nvfp4_cg.py
-              (CUDA-graphed draft), *_cg_diff.py / *_fwdcmp.py (correctness diagnostics)
-    docs/     ARCHITECTURE, ROADMAP, PROOF.md, receipts/, and the research records
-    shard/    engine module scaffolding (node, transport, specdec, topology)
+    phase0/   the live engine + deploy: m25_*.py (MiniMax-M2.5 stage/pipe/gateway —
+              the current betanet serve path), wire.py (sealed framing), mesh.py
+              (edge RTTs), specpipe.py (pipelined coordinator), launch + bench tooling
+    shard/    model-agnostic engine package: node.py (the ModelRuntime interface),
+              transport, scheduler, topology, manifest, fetch, receipt, challenge
+    research/ experiments — the GLM-5.2 swarm drivers (glm_swarm_nvfp4_*) and the M2.5
+              probes that fed the proven path
+    docs/     ARCHITECTURE, ROADMAP, MODEL_RUNTIME, NETWORK, INTEGRATION, PROOF.md,
+              receipts/, and the research records
 
 ## Roadmap
 
@@ -166,6 +181,15 @@ gpt-oss-120B is the faster, consumer-card build target the network is bootstrapp
   across heterogeneous GPUs, per-token payouts, fault tolerance — **mid-request heal demonstrated**
   (kill a node mid-generation, the request resumes on a spare and completes; `phase0/heal.py`,
   [receipt](docs/receipts/fault-tolerance-20260623.json)).
+- **One engine, every model.** The serve path is being generalized behind a single
+  `ModelRuntime` interface (`shard/node.py`) so the network runs *any* model, not one
+  hand-ported architecture — the model layer is inherited from the ecosystem; the moat
+  (ring, transport, spec-decode, verification) stays in-house. Direction in
+  [docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md); in progress.
+- **Horizon — beyond inference.** The same permissionless rails (identity, transport,
+  content-addressed weights, verification, payment) are meant to carry general compute,
+  training included. That is a separate execution core — honestly years past the inference
+  fabric — named here as the direction, not a claim.
 
 Full detail, pass/fail criteria, and risks: [docs/ROADMAP.md](docs/ROADMAP.md).
 

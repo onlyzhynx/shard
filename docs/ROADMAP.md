@@ -1,5 +1,11 @@
 # Shard roadmap
 
+**North star:** Shard is the engine for a permissionless worldwide compute fabric — *BitTorrent for
+VRAM/compute* — where GPUs of any kind swarm to run many models, ever bigger, and eventually training and
+general compute. **MiniMax-M2.5 sharded inference is the betanet: the first rung, the proof-of-concept, not
+the destination.** The phases below harden that first rung into a permissionless network; the
+model-genericity and general-compute arcs are in "Beyond the betanet" at the end.
+
 Phased so the riskiest thing is proven first and cheaply. Each phase has one goal and a hard pass/fail.
 
 ## Phase 0 — prove the transport (target: 1-2 days)
@@ -39,9 +45,9 @@ The payoff. Add the draft-verify loop.
 
 **→ Opened an active research track: [WAN-optimal speculative decoding](research/wan-speculative-decoding.md).** Instrumenting the round (draft 309 ms + verify 224 ms) showed the bottleneck at 120B is the *draft cost*, not the WAN — the verify alone implies a ~15 tok/s ceiling with a free draft. The draft is stuck at ~62 ms/tok because gpt-oss's MXFP4-MoE kernels won't `sdpa`/`compile` and the flash sink kernel is Hopper-only. Path to ~20 tok/s on consumer GPUs over WAN: a cheap draft (optimized kernels, or an EAGLE-style trained head) **then** tree speculation. See the doc for the evidence and plan.
 
-## Build target for Phases 3+ — gpt-oss-120B on the 4× RTX 4090 swarm
+## Build target for Phases 3+ — MiniMax-M2.5 on the scattered-5090 swarm (the betanet)
 
-The permissionless layer is built and proven **first on gpt-oss-120B across four RTX 4090s**, then generalized up. That rig is what a real volunteer's hardware actually looks like (24GB consumer cards, not 96GB Blackwell), it's the most practical swarm a stranger can join today, and it's the cheapest to iterate on Vast. The GLM-5.2 744B run (~30 tok/s, 7 GPUs) already proved the performance ceiling and that the engine scales up; the 120B/4090 setup is the development target for everything below. Once the permissionless stack works there, it carries up to the 744B class unchanged.
+The permissionless layer is built and proven on the **betanet base model, MiniMax-M2.5** (229B-A10B MoE), across scattered consumer 5090s — the hardware a real volunteer runs, and the cheapest to iterate on Vast. M2.5 is warm-validated over libp2p with signed receipts (tool-calling, multi-turn, long context). Earlier proofs still stand and bound the engine's range: **gpt-oss-120B at ~40 tok/s on 4× RTX 4090** (consumer-card target) and **GLM-5.2 744B at ~30 tok/s on 7 GPUs** (frontier-size ceiling). Once the permissionless stack works on the betanet, it carries to other models — the serve path is being generalized behind one `ModelRuntime` interface so the network runs *any* model, not one hand-ported architecture (see [MODEL_RUNTIME.md](MODEL_RUNTIME.md)).
 
 **Foundation already proven (Phases 0-2).** Owned authenticated + encrypted transport, fail-fast edge supervision, pipelined speculative decoding, and the split itself. gpt-oss-120B (MXFP4, 36 layers) now runs at **~40 tok/s (peak ~42), greedy/exact, over WAN on 3 scattered RTX 4090s** + a coordinator (`phase0/specpipe.py` pipelined coordinator, `phase0/launch_oss.py`) — up from a latency-bound ~18 via: async-draft pipelining, a **3-stage 12-layer ring** (4 WAN hops not 5), and **placing the layer-less coordinator in-region** (cut the ring 174→102 ms). GLM-5.2 744B runs across 7 scattered GPUs at ~30 tok/s (the frontier-size proof). What's left is turning this *hand-deployed* swarm into one that strangers can join, get paid by, can't cheat, and can't leak. That is Phases 3-6.
 
@@ -80,6 +86,22 @@ The privacy pillar earns its word here, phase by phase, never overclaimed earlie
 - **Per-request "trusted nodes only"** routing for sensitive jobs, tied to stake.
 - **Security pass** on the rendezvous + transport.
 - Full detail and the privacy threat model live in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Beyond the betanet — where the fabric goes
+
+The post-betanet arcs. Named honestly as direction, not as proven work.
+
+- **One engine, every model.** Generalize the serve path behind a single `ModelRuntime` interface
+  (`shard/node.py`): inherit the per-architecture forward pass + kernels from the ecosystem
+  (vLLM/Transformers), keep the moat — ring, transport, spec-decode, verification — in-house. *Pass = a
+  second model (a small dense one) onboards and serves end-to-end over the ring with no engine changes.*
+  Decision + plan: [MODEL_RUNTIME.md](MODEL_RUNTIME.md). **In progress.**
+- **Many, ever-bigger models.** A catalog of models, each sharded across swarms sized to its needs; the
+  manifest already carries `arch`, the catalog already exists c0mpute-side ([INTEGRATION.md](INTEGRATION.md) §4).
+- **General compute, training included.** The permissionless rails (identity, transport, content-addressed
+  weights, verification, payment) are meant to carry compute beyond inference. Training over a scattered WAN
+  swarm is a **separate execution core**, not an extension of the inference engine — the rails carry over, the
+  compute core does not. Years out; named as the destination, not a claim.
 
 ## The honest risk register
 

@@ -15,8 +15,10 @@ pool together to serve a model far too big for any single card. No datacenter. N
 Uncensored, private, and the people who supply the compute get paid.
 
 c0mpute already runs single-GPU inference across volunteer GPUs. This is the next layer — **swarm
-inference**: many scattered consumer GPUs collectively serving a 120B or 744B model over the open
-internet, fast enough to actually use.
+inference**: many scattered consumer GPUs collectively serving a model far too big for one card, over
+the open internet, fast enough to actually use. That is the betanet (today, on MiniMax-M2.5); the arc is
+a general compute fabric — *many* models, ever bigger, and eventually training and compute beyond
+inference, on the same permissionless rails.
 
 And it's real, not a whitepaper. gpt-oss-120B at **~40 tok/s**, GLM-5.2 744B at **~30 tok/s**, on
 consumer RTX 4090s and Blackwell cards scattered across US states — every run emits a verifiable

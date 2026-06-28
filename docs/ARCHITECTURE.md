@@ -22,11 +22,11 @@ Shard attacks (1) with speculative decoding and (2) with a transport it owns.
 
 ### 1. Per-node runtime (`shard/node.py`)
 
-Each node runs a serving engine for its block of layers. We do **not** rebuild attention kernels, paging, or quantization. We wrap **SGLang** (battle-tested, production-grade) and drive it at the block level:
+Each node runs a serving engine for its block of layers. We do **not** rebuild attention kernels, paging, or quantization — that is commodity we inherit. The per-node runtime is the **`ModelRuntime` interface** (`shard/node.py`): a model-agnostic firewall whose backend (vLLM / Transformers per-architecture modules + quant kernels) is **swappable per model**, never the engine itself. This is what makes Shard *one engine for every model*, not an M2.5 server. Full decision: [MODEL_RUNTIME.md](MODEL_RUNTIME.md).
 
-- `load_shard(model, layer_range)` — pull only this block's weights (from HF or a c0mpute mirror) and load to VRAM
-- `forward(hidden_states, kv_meta) -> hidden_states` — run this block, return activations for the next stage
-- KV-cache lives per-node for its own layers; the coordinator tracks sequence ids
+- `load_shard()` — pull only this block's weights (HF or a c0mpute mirror), keys derived from the manifest, and load to VRAM
+- `embed` / `forward(hidden_states, start_pos) -> hidden_states` / `logits` — head embeds, middle stages forward, tail samples; KV-cache lives per-node and crops to `start_pos` for spec-decode rollback
+- The moat — ring, transport, spec-decode, scheduler, receipts, verification — stays in-house; only the model execution is inherited.
 
 A node is just: a block of layers + a transport endpoint + a heartbeat.
 
@@ -92,8 +92,8 @@ Recommendation: build **a + d** into the core (pin the leaky boundary layers, ne
 
 | Layer | Decision |
 |---|---|
-| GPU kernels, attention, paging, quant | Reuse SGLang. Rebuilding this is insane. |
-| Per-node block serving | Thin wrapper over SGLang |
+| GPU kernels, attention, paging, quant | Inherit from the ecosystem (vLLM/Transformers). Rebuilding this is insane. |
+| Per-node block serving | A `ModelRuntime` backend behind one interface — swappable per model, never the engine |
 | Inter-stage transport | **Build + own** (this is the wedge) |
 | Speculative decoding loop | **Build** (nothing off-the-shelf does this) |
 | Scheduler / allocation | Build, light |
