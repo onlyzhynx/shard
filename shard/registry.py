@@ -30,7 +30,7 @@ Schema (`schema: "shard-models/1"`):
           "gbPerLayer": 1.05,             # model bytes/layer at the served quant (VRAM fit)
           "kvGbPerLayer": 0.04,           # KV bytes/layer at target ctx (VRAM fit)
           "quant": "nvfp4",               # served quant format: nvfp4 | mxfp4 | fp8 | ...
-          "adapter": "glm-nvfp4",         # StageRuntime impl (M3): glm-nvfp4 | generic-vllm | ...
+          "adapter": "glm-nvfp4",         # ModelRuntime impl (shard/node.py): glm-nvfp4 | generic-vllm | generic-hf
           "tokenizerId": "zai-org/GLM-5.2",       # tokenizer the coordinator formats/detokenizes with
           "chatTemplate": null,           # null = use the tokenizer's built-in chat template
           "weightManifestCid": "",        # CID of the signed weight manifest (manifest.py); "" until hosted
@@ -59,9 +59,13 @@ DEFAULT_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "registry", "models.json"),
 )
 
-# Adapters the runtime knows how to instantiate (M3). The CI cross-repo test asserts every
-# registry row names one of these, so a typo'd adapter fails loudly instead of at spawn time.
-KNOWN_ADAPTERS = {"glm-nvfp4", "generic-vllm"}
+# Adapters the runtime knows how to instantiate (one ModelRuntime impl per id, shard/node.py).
+# The CI cross-repo test asserts every registry row names one of these AND that this set is
+# identical to c0mpute's KNOWN_ADAPTERS, so a typo'd adapter fails loudly (not at spawn time).
+#   glm-nvfp4    — the tuned GLM-NVFP4 specialized path
+#   generic-vllm — vLLM loader for production quant/MoE kernels (VllmRuntime, MODEL_RUNTIME.md)
+#   generic-hf / hf — universal HF/Transformers fallback (phase0/hf_runtime.GenericHFRuntime)
+KNOWN_ADAPTERS = {"glm-nvfp4", "generic-vllm", "generic-hf", "hf"}
 
 # Required fields on every model row. Missing any => RegistryError (fail closed, not a silent 0).
 REQUIRED_FIELDS = (
